@@ -21,8 +21,8 @@ Todo:
     * transform the depth masks/bboxes to the base_link frame [done]
     * Setup 3D [pointcloud]
     * transform the pointcloud masks/bboxes to the base_link frame [done]
-    * add pre transformed points to the pointcloud to avoid multiple transformations and see if it improves performance
-    * filter out objects with min_height above a certain threshold
+    * add pre transformed points to the pointcloud to avoid multiple transformations and see if it improves performance [done: it does]
+    * filter out objects/clusters with min_height above a certain threshold
     * publish as a derived_object
     * rename rgb to visual
     * add check for .engine model with try-catch and then convert to tensorrt
@@ -146,8 +146,8 @@ class ImageObstacleDetectionNode(Node):
         self.declare_parameter("max_det", 300)
         self.declare_parameter("classes", list(range(80)))
         self.declare_parameter("project_to_3d", True)  # todo: remove this flag and just use depth or pointcloud
-        self.declare_parameter("use_depth", True)  # can run both at the same time at the cost of speed. Depth is significantly faster for now (up to 5 times)
-        self.declare_parameter("use_pointcloud", False)  # can run both at the same time at the cost of speed. Depth is significantly faster for now (up to 5 times)
+        self.declare_parameter("use_depth", True)  # can run both at the same time at the cost of speed. Depth is significantly faster for now (about 2.5 times)
+        self.declare_parameter("use_pointcloud", False)  # can run both at the same time at the cost of speed. Depth is significantly faster for now (about 2.5 times)
         self.declare_parameter("output_frame", "base_link")  # e.g base_link.
         self.declare_parameter('static_camera_to_robot_tf', True)
         self.declare_parameter("transform_timeout", 0.1)
@@ -621,6 +621,9 @@ class ImageObstacleDetectionNode(Node):
         self.get_camera_to_robot_tf(frame_id, timestamp)
 
         if self.camera_to_robot_tf_o3d is not None:
+            # copy the original positions before transforming for later use without inversion.
+            # Leads to significant speedup over multiple transformations.
+            self.o3d_pointcloud.point.positions_inv = self.o3d_pointcloud.point.positions.clone()
             self.o3d_pointcloud = self.o3d_pointcloud.transform(self.camera_to_robot_tf_o3d)
             frame_id = self.output_frame
 
@@ -713,7 +716,6 @@ class ImageObstacleDetectionNode(Node):
         except Exception as e:
             self.get_logger().error(f'Error processing image: {e}')
             self.results = None
-
 
     def parse_results(self, results, header):
         if results is not None:
@@ -1022,22 +1024,20 @@ class ImageObstacleDetectionNode(Node):
         mask_data = (o3c.Tensor.from_dlpack(torch.utils.dlpack.to_dlpack(mask_data)).to(o3c.Dtype.Int64) * 255)
         mask_xy = mask.xy[0]
 
-        # (optional) if the points were projected to the robots frame since the points have to be in the camera frame
-        # todo: refactor as this involves projecting 3 times (first while preprocessing/cropping ROIs and twice here)
+        points = self.o3d_pointcloud.point.positions
+
+        # project back to the camera frame if the points were projected to the robots frame to project to the image
         if self.output_frame and self.camera_to_robot_tf_o3d is not None:
-            self.o3d_pointcloud = self.o3d_pointcloud.transform(self.camera_to_robot_tf_o3d.inv())
+            # self.o3d_pointcloud = self.o3d_pointcloud.transform(self.camera_to_robot_tf_o3d.inv())
+            points = self.o3d_pointcloud.point.positions_inv
 
         # Step 1: Project 3D points to 2D image plane
-        x_2d = (self.o3d_pointcloud.point.positions[:, 0] * fx / self.o3d_pointcloud.point.positions[:, 2]) + cx
-        y_2d = (self.o3d_pointcloud.point.positions[:, 1] * fy / self.o3d_pointcloud.point.positions[:, 2]) + cy
+        x_2d = (points[:, 0] * fx / points[:, 2]) + cx
+        y_2d = (points[:, 1] * fy / points[:, 2]) + cy
 
         # Step 2: project the mask to the pointcloud
         valid_points_mask = (x_2d >= 0) & (x_2d < mask_data.shape[1]) & \
                        (y_2d >= 0) & (y_2d < mask_data.shape[0])  # Find points that project into the mask image
-
-        # (optional) if the points were projected to the robots frame since the points have to be in the camera frame
-        if self.output_frame and self.camera_to_robot_tf_o3d is not None:
-            self.o3d_pointcloud = self.o3d_pointcloud.transform(self.camera_to_robot_tf_o3d)
 
         # Filter valid projected points
         # valid_projected_points = self.o3d_pointcloud.point.positions[valid_points_mask]
