@@ -322,7 +322,12 @@ RUN echo 'alias build="colcon build --symlink-install --event-handlers console_d
     echo "source /opt/ros/humble/setup.bash" >> /etc/bash.bashrc && \
     echo "source /ros2_ws/install/setup.bash" >> /etc/bash.bashrc
 
+## todo:remove this
+# Install Open3D 0.19.0 using pip
+RUN sudo apt purge python3-blinker -y && python3.10 -m pip install "open3d==0.19.0"
+
 ## Todo: remove the lines below in Release/production version
 RUN sudo apt update && sudo apt install gedit cheese nautilus net-tools iputils-ping nano -y
+
 
 CMD ["/bin/bash"]
