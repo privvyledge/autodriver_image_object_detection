@@ -19,17 +19,26 @@ Todo:
         * resize the mask to the original shape (or depth image shape) [done: no need]
     * Setup 3D [depth] [done]
     * transform the depth masks/bboxes to the base_link frame [done]
-    * Setup 3D [pointcloud]
+    * Setup 3D [done]
     * transform the pointcloud masks/bboxes to the base_link frame [done]
     * add pre transformed points to the pointcloud to avoid multiple transformations and see if it improves performance [done: it does]
+    * add support for batch inference (multiple cameras/images at once)
+    * use TimeSynchronizer if synchronization_interval == 0.0 or if approx_sync parameter is False
     * filter out objects/clusters with min_height above a certain threshold
+    * add a parameter to choose what timestamp should be put in the message (current time or message timestamp)
     * publish as a derived_object
-    * rename rgb to visual
+    * rename rgb to camera_0
+    * rename images to frame (to accomodate pointcloud)
     * add check for .engine model with try-catch and then convert to tensorrt
     * switch to engine models as the default
+    * add support for n cameras
+    * add ability to run multiple models simultaneously, e.g segmentation and obb
+    * setup limiting detected classes
     * publish detection pointcloud for debugging
     * plot tracks over time
     * Setup OBB (https://docs.ultralytics.com/reference/engine/results/#ultralytics.engine.results.OBB)
+    * publish the axes (/tf of detected objects)
+    * switch to image transport for more modularity and better compressed image support use try-catch to handle image transport not being installed (https://github.com/ros-perception/image_transport_tutorials?tab=readme-ov-file#py_simple_image_pub)
 """
 
 import time
@@ -130,7 +139,7 @@ class ImageObstacleDetectionNode(Node):
                                        description='',
                                        type=ParameterType.PARAMETER_STRING))
         self.declare_parameter('track_2d', True)
-        self.declare_parameter('track_3d', True)
+        self.declare_parameter('track_3d', True)  # todo: implement 3D tracking
         self.declare_parameter('tracker_2d', 'bytetrack.yaml')
         self.declare_parameter('queue_size', 1)
         self.declare_parameter('synchronization_interval', 0.1)
@@ -152,8 +161,8 @@ class ImageObstacleDetectionNode(Node):
         self.declare_parameter('static_camera_to_robot_tf', True)
         self.declare_parameter("transform_timeout", 0.1)
         self.declare_parameter('static_camera_info', True)
-        self.declare_parameter('depth_scale', 1000.0)
-        self.declare_parameter('depth_max', 4.0)
+        self.declare_parameter('depth_scale', 1000.0)  # mm to meters
+        self.declare_parameter('depth_max', 4.0)  # meters
         self.declare_parameter(name='normalize_depth', value=False, descriptor=ParameterDescriptor(
                 description='',
                 type=ParameterType.PARAMETER_BOOL))
@@ -463,7 +472,7 @@ class ImageObstacleDetectionNode(Node):
                         self.detection_image_pub.publish(detection_image_msg)
                     if self.segmentation_mask_image_topic and (mask_img is not None):
                         if self.image_message_format in ("compressed", "packet"):
-                            mask_image_msg = self.bridge.compressed_imgmsg_to_cv2(
+                            mask_image_msg = self.bridge.cv2_to_compressed_imgmsg(
                                     mask_img,
                                     desired_encoding="mono8")
                         else:
@@ -477,7 +486,12 @@ class ImageObstacleDetectionNode(Node):
 
                     if self.segmentation_image_topic and (mask_img is not None):
                         # color_mask_img = cv2.cvtColor(mask_img, cv2.COLOR_GRAY2BGR)
+                        # todo: show the image and find why the channels are inverted. get the color image before its inverted and published
                         color_mask_img = cv2.bitwise_and(self.images['rgb'], self.images['rgb'], mask=mask_img)
+                        if self.show_image:
+                            cv2.imshow("color_mask_image", color_mask_img)
+                            cv2.waitKey(1)
+
                         if self.image_message_format in ("compressed", "packet"):
                             color_mask_image_msg = self.bridge.compressed_imgmsg_to_cv2(
                                     color_mask_img,
@@ -843,7 +857,8 @@ class ImageObstacleDetectionNode(Node):
                         marker_depth_array.markers.append(
                             self.create_marker(
                                 i, x, y, z, size_x, size_y, size_z, frame_id,
-                                depth_timestamp, conf, result.names.get(int(cls)), track_id=None))
+                                depth_timestamp, conf, result.names.get(int(cls)), track_id=None,
+                                rgba=[1.0, 0.0, 0.0, 0.5]))
 
                     if self.use_pointcloud and (self.images['pointcloud'] is not None):
                         x, y, z, size_x, size_y, size_z, quat, points_3d = self.project_to_3d_with_pointcloud(
@@ -863,7 +878,8 @@ class ImageObstacleDetectionNode(Node):
                         marker_pointcloud_array.markers.append(
                             self.create_marker(
                                 i, x, y, z, size_x, size_y, size_z, frame_id,
-                                pointcloud_timestamp, conf, result.names.get(int(cls)), track_id=None, quat=quat))
+                                pointcloud_timestamp, conf, result.names.get(int(cls)), track_id=None, quat=quat,
+                                rgba = [0.0, 1.0, 0.0, 0.5]))
 
             if self.project_to_3d:
                 if self.use_depth:
@@ -1173,7 +1189,10 @@ class ImageObstacleDetectionNode(Node):
         return det_msg
 
     def create_marker(self, marker_id, x, y, z, size_x, size_y, size_z,
-                      frame_id, timestamp=None, confidence=None, class_id=None, track_id=None, quat=None):
+                      frame_id, timestamp=None, confidence=None, class_id=None, track_id=None, quat=None,
+                      rgba=None):
+        if rgba is None:
+            rgba = [1.0, 0.0, 0.0, 0.5]
         marker = Marker()
         marker.header.frame_id = frame_id
         if timestamp is None:
@@ -1200,12 +1219,12 @@ class ImageObstacleDetectionNode(Node):
             marker.color.g = float((color_hash & 0x00FF00) >> 8) / 255.0
             marker.color.b = float(color_hash & 0x0000FF) / 255.0
         else:
-            marker.color.r = 1.0
-            marker.color.g = 0.0
-            marker.color.b = 0.0
-            marker.color.a = 0.5
+            marker.color.r = rgba[0]
+            marker.color.g = rgba[1]
+            marker.color.b = rgba[2]
+            marker.color.a = rgba[3]
 
-        marker.lifetime = rclpy.duration.Duration(seconds=0.1).to_msg()
+        marker.lifetime = rclpy.duration.Duration(seconds=0.5).to_msg()  # 0.1 todo: set as a parameter
         return marker
 
     def get_camera_to_robot_tf(self, source_frame_id, timestamp=None):
