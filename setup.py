@@ -63,6 +63,7 @@ setup(
         entry_points={
             'console_scripts': [
                 'yolo_detector = autodriver_image_object_detection.yolo_detection_node:main',
+                'single_stream_detector = autodriver_image_object_detection.single_stream_detector:main',
             ],
         },
 )

@@ -2,25 +2,149 @@
 Usage:
     ros2 launch autodriver_image_object_detection stream.launch.py num_cameras:=2 frame_ids:=["camera_frame_1", "camera_frame_2"] namespaces:=["/camera_1", "/camera_2"] camera_info_files:=["camera_info_1.yaml", "camera_info_2.yaml"]
 
+Tips: todo: move to a github gist and blog article
+    * Sample gstreamer configs
+        * Launching a feed
+            * File
+            * Camera (live feed)
+            * RTSP: rtsp://your_camera_ip:port/stream_path
+                * Server (optional: if not running elsewhere). Use one:
+                    * UDPSink:
+                        * Camera
+                            * H264:
+                                * gst-launch-1.0 -v v4l2src device=/dev/video0 ! decodebin ! x264enc ! rtph264pay ! udpsink host=${IP_ADDRESS} port=${PORT}
+                                gst-launch-1.0 -vvvv v4l2src ! 'video/x-raw, width=640, height=480, framerate=30/1' ! videoconvert !  x264enc pass=qual quantizer=20 tune=zerolatency ! rtph264pay ! udpsink port=${PORT}
+                        * File (use one):
+                            * H264:
+                                * gst-launch-1.0 -v filesrc location=${PATH_TO_FILE} ! decodebin ! x264enc ! rtph264pay ! udpsink host=127.0.0.1 port=${PORT}
+                                * gst-launch-1.0 -v filesrc location=${PATH_TO_FILE} ! decodebin ! x264enc ! rtph264pay config-interval=1 pt=96 ! udpsink host=${IP_ADDRESS} port=${PORT}
+                                * gst-launch-1.0 filesrc location=${PATH_TO_FILE} ! qtdemux ! queue ! h264parse ! rtph264pay config-interval=10 ! udpsink host=${IP_ADDRESS} port=${PORT} -v
+                            * JPEG:
+                                * gst-launch-1.0 -v filesrc location=${PATH_TO_FILE} ! decodebin ! videoconvert ! jpegenc ! rtpjpegpay ! udpsink host=${IP_ADDRESS} port=${PORT}
+
+                    * TCPSink:
+                        * gst-launch-1.0 -vvvv v4l2src ! 'video/x-raw, width=640, height=480, framerate=30/1' ! videoconvert ! jpegenc ! rtpjpegpay ! rtpstreampay ! tcpserversink port=7001
+
+                * Client
+                    Test:
+                        * gst-launch-1.0 -v videotestsrc ! videoconvert ! videoscale ! video/x-raw,width=640,height=480 ! x264enc speed-preset=veryfast tune=zerolatency bitrate=800 ! rtspclientsink location=rtsp://localhost:8554/test
+
 Todo:
+    * add global namespace [done]
+    * update the code [done]
+    * setup do timestamps [done]
+    * Test image encoding [done]
+    * make width, height, encoding and fps optional [done]
+    * handle single item passed for width, height, fps, etc [done]
+    * test camera_info [done]
+    * test if compressed topics are published [done]
+    * test sensor data qos [done]
+    * test using appsink [done]
+    * test new list string parsing [done]
+    * visualize the image using RQT or RViz [done]
+    * add support for file saving (use my package instead)
+    * add support for mjpg (H264) encoding and print auto checking result
     * setup file, camera camera and rtsp streaming
+    * cleanup the autoconfig string addition
     * add composition
 """
 import os
+import subprocess
 import json
+import re
 from launch import LaunchDescription, LaunchContext
 from launch_ros.actions import Node, SetRemap, PushRosNamespace, SetParametersFromFile, SetParameter
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression, EnvironmentVariable
 from launch_ros.substitutions import FindPackageShare
 from launch.conditions import IfCondition, UnlessCondition, LaunchConfigurationEquals, LaunchConfigurationNotEquals
-from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument, GroupAction, OpaqueFunction, SetEnvironmentVariable, LogInfo, TimerAction
+from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument, GroupAction, OpaqueFunction, \
+    SetEnvironmentVariable, LogInfo, TimerAction
 from launch_xml.launch_description_sources import XMLLaunchDescriptionSource
 from launch.launch_description_sources import PythonLaunchDescriptionSource, FrontendLaunchDescriptionSource
 from ament_index_python.packages import get_package_share_directory
+from ament_index_python.packages import PackageNotFoundError as ROS2PackageNotFoundError
 from launch_ros.descriptions import ComposableNode
 from launch_ros.actions import ComposableNodeContainer
 
+
+def parse_list_string(list_string):
+    try:
+        parsed_string = json.loads(list_string)
+    except json.JSONDecodeError:
+        parsed_string = list_string.strip('[]').split(',')
+        parsed_string = [s.strip() for s in parsed_string]
+    return parsed_string
+
+def post_process_list_string(parsed_string, list_length):
+    # todo: refactor this function and simplify
+    # todo: handle strings instead of assuming only integers
+    post_processed_list = parsed_string
+    # handle singular, empty or 'none' value for fps, width, height, encoding, etc.
+    # ## single int or float value passed
+    if isinstance(parsed_string, (int, float)):
+        return [int(parsed_string)] * list_length
+
+    # ## single list value passed
+    if len(parsed_string) == 1:
+        # handle list of string of length 1, e.g '["1"]'
+        if isinstance(parsed_string, str):
+            if parsed_string.lower().strip() in ["none", "false"]:
+                post_processed_list = [0] * list_length
+            else:
+                post_processed_list = [int(float(parsed_string))] * list_length
+        else:
+            post_processed_list = [int(float(parsed_string[0]))] * list_length
+
+    # ## check if a single string is passed and if it is 'none' then set to empty string
+    if isinstance(parsed_string, str):
+        if parsed_string.lower().strip() in ["none", "false"]:
+            post_processed_list = [0] * list_length
+        elif parsed_string.lower().strip() == "":
+            post_processed_list = [0] * list_length
+        else:
+            post_processed_list = [int(float(parsed_string))] * list_length
+
+    # ## empty values passed
+    if len(parsed_string) == 0:
+        post_processed_list = [0] * list_length
+
+    # ## check if a list type passed then assert length matches num_cameras
+    if isinstance(parsed_string, list):
+        assert len(parsed_string) == list_length, "fps list length must match num_cameras"
+        post_processed_list = [int(parsed_string_i) for parsed_string_i in parsed_string]
+
+    # todo: refactor this
+    for i in range(list_length):
+        if isinstance(parsed_string[i], list) and parsed_string[i] == "":
+            post_processed_list[i] = 0
+    return post_processed_list
+
+def clean_gstreamer_pipeline(pipeline: str) -> str:
+    # Remove appsink from the gsconfig script if present as gscam automatically adds it.
+    cleaned_pipeline = re.sub(r'!\s*appsink', '', pipeline).strip()
+    return cleaned_pipeline
+
+
 def launch_setup(context, *args, **kwargs):
+    # Define some constants
+    mux_types = {
+        '.mkv': 'matroskamux',
+        '.flv': 'flvmux',
+        '.avi': 'avimux',
+        '.mp4': 'mp4mux',
+        '.mov': 'qtmux',
+        '.webm': 'webmmux',
+        '.ts': 'tsdemux',
+        '.mp2': 'mpegtsmux'
+    }
+
+    image_encoding_to_gstreamer_format = {
+        'rgb8': 'RGB8',
+        'mono8': 'GRAY8',
+        'yuv422': 'YUY2',
+        'jpeg': ''
+    }
+
     # Get package directories
     image_detection_dir = get_package_share_directory('autodriver_image_object_detection')
 
@@ -29,16 +153,21 @@ def launch_setup(context, *args, **kwargs):
 
     # Declare launch configuration variables
     use_sim_time = LaunchConfiguration('use_sim_time', default="False")
+    use_global_namespace = LaunchConfiguration('use_global_namespace', default="False")
+    global_namespace = LaunchConfiguration('global_namespace', default="/")
     num_cameras = LaunchConfiguration('num_cameras', default=1)
     frame_ids = LaunchConfiguration('frame_ids', default='["camera_frame"]')
     namespaces = LaunchConfiguration('namespaces', default='["/camera"]')
     camera_info_files = LaunchConfiguration('camera_info_files', default='["camera_info.yaml"]')
     stream_sources = LaunchConfiguration('stream_sources')
+    stream_format = LaunchConfiguration('stream_format', default='["raw"]')
     stream_types = LaunchConfiguration('stream_types', default='["file"]')
     fps = LaunchConfiguration('fps', default='["30"]')
-    widths = LaunchConfiguration('widths', default='["640"]')
-    heights = LaunchConfiguration('heights', default='["480"]')
+    widths = LaunchConfiguration('widths', default='640')
+    heights = LaunchConfiguration('heights', default='"480"')
     gscam_config = LaunchConfiguration('gscam_config', default='[""]')
+    save_videos = LaunchConfiguration('save_videos', default="False")
+    video_save_filenames = LaunchConfiguration('video_save_filenames', default='["video0.mp4"]')
     loop = LaunchConfiguration('loop', default="True")
     sync_sink = LaunchConfiguration('sync_sink', default="True")
     use_gst_timestamps = LaunchConfiguration('use_gst_timestamps', default="True")
@@ -52,6 +181,18 @@ def launch_setup(context, *args, **kwargs):
             'use_sim_time',
             default_value=use_sim_time,
             description='Use simulation (Gazebo) clock if true')
+
+    declare_use_global_namespace_cmd = DeclareLaunchArgument(
+            'use_global_namespace',
+            default_value=use_global_namespace,
+            description='Prepend a global namespace if true.'
+    )
+
+    declare_global_namespace_cmd = DeclareLaunchArgument(
+            'global_namespace',
+            default_value=global_namespace,
+            description='Global namespace prepended to all nodes generated.'
+    )
 
     declare_num_cameras_cmd = DeclareLaunchArgument(
             'num_cameras',
@@ -83,31 +224,60 @@ def launch_setup(context, *args, **kwargs):
             description='Path to stream sources. Should be a list of paths. '
                         'For each item, if stream type is a file, pass in the path to the file, '
                         'for live camera, pass in the device e.g /dev/video0, '
-                        'for rtsp, pass in the url, e.g rtsp://your_camera_ip:port/stream_path.'
+                        'for rtsp, pass in the url, e.g rtsp://your_camera_ip:port/stream_path. '
+                        'Used only if gscam_config is empty.'
+    )
+
+    declare_stream_format_cmd = DeclareLaunchArgument(
+            'stream_format',
+            default_value=stream_format,
+            description='List of stream formats for each camera. Options: "raw", "mjpg". '
+                        'Make sure to check the formats available for your stream_type(s) '
+                        'by running: "v4l2-ctl --list-formats-ext". Usually YUYV and MJPG are available. '
+                        'This was mostly added to handle MJPG streams correctly since the GSCAM node does not publish '
+                        'MJPGs correctly, e.g if high resolution/fps is passed even though the camera supports it. '
+                        'Tip: specify "MJPG" and image_encoding:=rgb8 to get high rate MJPGs'
+                        'Used only if gscam_config is empty.'
     )
 
     declare_stream_types_cmd = DeclareLaunchArgument(
             'stream_types',
             default_value=stream_types,
-            description='List of stream types for each camera. Options: "file", "rtsp", "camera"'
+            description='List of stream types for each camera. Options: "file", "rtsp", "camera". '
+                        'Used only if gscam_config is empty.'
     )
 
     declare_fps_cmd = DeclareLaunchArgument(
             'fps',
             default_value=fps,
-            description='List of fps for each camera. Can also pass in a single integer that applies to all.'
+            description='List of fps for each camera. Can also pass in a single integer that applies to all. '
+                        'Set to 0 to use the default FPS. '
+                        'If Gstreamer fails to get a sample, '
+                        'it is probably due to passing in unsupported width+height+fps+encoding combinations. '
+                        'Run "v4l2-ctl --list-formats-ext" to see the supported combinations for the cameras.'
+                        'Used only if gscam_config is empty.'
     )
 
     declare_widths_cmd = DeclareLaunchArgument(
             'widths',
             default_value=widths,
-            description='List of widths for each camera. Can also pass in a single integer that applies to all.'
+            description='List of widths for each camera. Can also pass in a single integer that applies to all. '
+                        'Set to 0 to use the default FPS. '
+                        'If Gstreamer fails to get a sample, '
+                        'it is probably due to passing in unsupported width+height+fps+encoding combinations. '
+                        'Run "v4l2-ctl --list-formats-ext" to see the supported combinations for the cameras.'
+                        'Used only if gscam_config is empty.'
     )
 
     declare_heights_cmd = DeclareLaunchArgument(
             'heights',
             default_value=heights,
-            description='List of heights for each camera. Can also pass in a single integer that applies to all.'
+            description='List of heights for each camera. Can also pass in a single integer that applies to all. '
+                        'Set to 0 to use the default FPS. '
+                        'If Gstreamer fails to get a sample, '
+                        'it is probably due to passing in unsupported width+height+fps+encoding combinations. '
+                        'Run "v4l2-ctl --list-formats-ext" to see the supported combinations for the cameras.'
+                        'Used only if gscam_config is empty.'
     )
 
     declare_gscam_config_cmd = DeclareLaunchArgument(
@@ -115,6 +285,19 @@ def launch_setup(context, *args, **kwargs):
             default_value=gscam_config,
             description='List of gscam config file paths for each stream. '
                         'Pass in a list of empty strings to infer from stream source.'
+    )
+
+    declare_save_videos_cmd = DeclareLaunchArgument(
+            'save_videos',
+            default_value=save_videos,
+            description='Save videos if true.'
+    )
+
+    declare_video_save_filenames_cmd = DeclareLaunchArgument(
+            'video_save_filenames',
+            default_value=video_save_filenames,
+            description='List of video save filenames for each camera. '
+                        'Used only if save_videos is true. Recommended: .mp4, .avi, .mpeg'
     )
 
     declare_loop_cmd = DeclareLaunchArgument(
@@ -146,7 +329,14 @@ def launch_setup(context, *args, **kwargs):
     declare_image_encoding_cmd = DeclareLaunchArgument(
             'image_encoding',
             default_value=image_encoding,
-            description='image encoding ("rgb8", "mono8", "yuv422", "jpeg").'
+            description='image encoding ("rgb8", "mono8", "yuv422", "jpeg"). '
+                        'The image encoding used by the ROS2 publisher. '
+                        'This is usually different from the stream format '
+                        'although its usually the same except for jpeg. '
+                        'Recommended: do not use "jpeg" as the '
+                        ' image driver automatically publishes compressed jpegs for the other encodings.'
+                        'If using jpeg, publishes only a compressed image, i.e appends "/compressed to the topic name.".'
+                        '"jpeg" may be deprecated in future versions of this launch files.'
     )
 
     # declare_use_composition_cmd = DeclareLaunchArgument(
@@ -157,16 +347,21 @@ def launch_setup(context, *args, **kwargs):
 
     launch_args = [
         declare_use_sim_time_cmd,
+        declare_use_global_namespace_cmd,
+        declare_global_namespace_cmd,
         declare_num_cameras_cmd,
         declare_frame_ids_cmd,
         declare_namespaces_cmd,
         declare_camera_info_files_cmd,
         declare_stream_sources_cmd,
+        declare_stream_format_cmd,
         declare_stream_types_cmd,
         declare_fps_cmd,
         declare_widths_cmd,
         declare_heights_cmd,
         declare_gscam_config_cmd,
+        declare_save_videos_cmd,
+        declare_video_save_filenames_cmd,
         declare_loop_cmd,
         declare_sync_sink_cmd,
         declare_use_gst_timestamps_cmd,
@@ -176,37 +371,37 @@ def launch_setup(context, *args, **kwargs):
     ]
 
     # Launch nodes
+    use_global_namespace_str = use_global_namespace.perform(context)
+    global_namespace_str = global_namespace.perform(context)
     num_cameras_int = int(num_cameras.perform(context))
-    frame_ids_list = json.loads(frame_ids.perform(context))  # frame_ids.perform(context).strip('[]').split(',')
-    namespaces_list = json.loads(namespaces.perform(context))  # namespaces.perform(context).strip('[]').split(',')
-    camera_info_files_list = json.loads(camera_info_files.perform(context))
-    stream_sources_list = json.loads(stream_sources.perform(context))
-    stream_types_list = json.loads(stream_types.perform(context))
-    try:
-        fps_list = json.loads(fps.perform(context))
-    except (json.JSONDecodeError, json.decoder.JSONDecodeError):
-        fps_list = [int(fps.perform(context))]
-
-    try:
-        widths_list = json.loads(widths.perform(context))
-    except (json.JSONDecodeError, json.decoder.JSONDecodeError):
-        widths_list = [int(widths.perform(context))]
-
-    try:
-        heights_list = json.loads(heights.perform(context))
-    except (json.JSONDecodeError, json.decoder.JSONDecodeError):
-        heights_list = [int(heights.perform(context))]
-
-    gscam_config_list = json.loads(gscam_config.perform(context))
-    image_encoding = image_encoding.perform(context)
+    frame_ids_list =  parse_list_string(frame_ids.perform(context))
+    namespaces_list =  parse_list_string(namespaces.perform(context))
+    camera_info_files_list = parse_list_string(camera_info_files.perform(context))
+    stream_sources_list = parse_list_string(stream_sources.perform(context))
+    stream_format_list = parse_list_string(stream_format.perform(context))
+    stream_types_list = parse_list_string(stream_types.perform(context))
+    fps_list = post_process_list_string(parse_list_string(fps.perform(context)), list_length=num_cameras_int)
+    widths_list = post_process_list_string(parse_list_string(widths.perform(context)), list_length=num_cameras_int)
+    heights_list = post_process_list_string(parse_list_string(heights.perform(context)), list_length=num_cameras_int)
+    gscam_config_list = parse_list_string(gscam_config.perform(context))
+    save_videos_str = save_videos.perform(context)
+    video_save_filenames_list = parse_list_string(video_save_filenames.perform(context))
+    loop_str = loop.perform(context)
+    sync_sink_str = sync_sink.perform(context)
+    use_gst_timestamps_str = use_gst_timestamps.perform(context)
+    use_sensor_data_qos_str = use_sensor_data_qos.perform(context)
+    image_encoding_str = image_encoding.perform(context)
 
     # Ensure lists have the correct length
     assert len(frame_ids_list) == num_cameras_int, "frame_ids list length must match num_cameras"
     assert len(namespaces_list) == num_cameras_int, "namespaces list length must match num_cameras"
     assert len(camera_info_files_list) == num_cameras_int, "camera_info_files list length must match num_cameras"
     assert len(stream_sources_list) == num_cameras_int, "stream_sources list length must match num_cameras"
+    assert len(stream_format_list) == num_cameras_int, "stream_format list length must match num_cameras"
     assert len(stream_types_list) == num_cameras_int, "stream_types list length must match num_cameras"
     assert len(gscam_config_list) == num_cameras_int, "gscam_config list length must match num_cameras"
+    if save_videos_str.lower() == 'true':
+        assert len(video_save_filenames_list) == num_cameras_int, "video_save_filenames list length must match num_cameras"
 
     # Generate gscam nodes
     nodes_to_launch = []
@@ -214,56 +409,191 @@ def launch_setup(context, *args, **kwargs):
     for i in range(num_cameras_int):
         # If the config is empty, use stream sources to choose
         if gscam_config_list[i] == "":
-            format = f'video/x-raw,framerate={fps_list[i]},width={widths_list[i]},height={heights_list[i]}'
-            if image_encoding == "jpeg":
-                format += ' ! jpegenc ! multipartmux ! multipartdemux ! jpegparse'
+            input_codec = 'video/x-raw,'
+            if stream_format_list[i] in ("", "raw", "yuyv"):
+                input_codec = 'video/x-raw'
+
+            elif stream_format_list[i].lower() in ("jpeg", "mjpg", "mjpeg"):
+                # try to detect if the device supports MJPG
+                try:
+                    # Query the device's supported formats.
+                    output = subprocess.check_output(
+                            ["v4l2-ctl", "--list-formats-ext", "-d", stream_sources_list[i]]).decode("utf-8")
+                    # If MJPG is found, use the MJPG pipeline.
+                    if "MJPG" in output or "Motion-JPEG" in output:
+                        input_codec = 'image/jpeg'
+                    else:
+                        # If MJPG is not found, use the raw pipeline.
+                        input_codec = 'video/x-raw'
+                        print(f"Device {stream_sources_list[i]} does not support MJPG. Using raw pipeline.")
+                        nodes_to_launch.append(
+                                LogInfo(
+                                        msg=f"Device {stream_sources_list[i]} does not support MJPG. "
+                                            f"Using raw pipeline."))
+                except (subprocess.SubprocessError, subprocess.CalledProcessError) as e:
+                    # Log or print the error if needed and keep the default raw pipeline.
+                    input_codec = 'video/x-raw'
+                    nodes_to_launch.append(
+                            LogInfo(
+                                    msg=f'Could not determine pixel formats for {stream_sources_list[i]}: {e}. '
+                                        f'Using raw pipeline.'))
+
+            fps_string = ''
+            width_string = ''
+            height_string = ''
+            if (isinstance(fps_list[i], (float, int)) and fps_list[i] > 0) or (
+                    isinstance(fps_list[i], str) and fps_list[i] != "0"):
+                fps_string = f',framerate={int(fps_list[i])}/1'
+            if (isinstance(widths_list[i], (float, int)) and widths_list[i] > 0) or (
+                    isinstance(widths_list[i], str) and widths_list[i] != "0"):
+                width_string = f',width={int(widths_list[i])}'
+            if (isinstance(heights_list[i], (float, int)) and heights_list[i] > 0) or (
+                    isinstance(heights_list[i], str) and heights_list[i] != "0"):
+                height_string = f',height={int(heights_list[i])}'
+
+            video_properties = f'{fps_string}{width_string}{height_string}'
+            video_convert_str = ' ! videoconvert'
+            timestamp_config_string = ''
+            output_format_type = image_encoding_to_gstreamer_format.get(image_encoding_str.lower(), 'RGB8')
+            output_format_str = f' ! video/x-raw,format={output_format_type}'
+
+            if use_gst_timestamps_str.lower() == "true":
+                timestamp_config_string = 'do-timestamp=true'
+            jpeg_config = ''
+            mjpg_config = ' ! jpegparse ! jpegdec' if stream_format_list[i] in ("jpeg", "mjpg", "mjpeg") else ''
+            if image_encoding_str == "jpeg":
+                # this block and image_encoding_str == "jpeg" is only used here to match the behaviour one of the GSCAM examples. Use the default image_encoding_str == "rgb8" for normal operation with streams_format="MJPG"
+                jpeg_config = ' ! jpegenc ! multipartmux ! multipartdemux ! jpegparse'
+                video_convert_str = '' if stream_sources_list[i] == "camera" else ' ! videoconvert' # only if the stream_source is a camera
+                mjpg_config = ''
+                input_codec = 'video/x-raw' if stream_sources_list[i] == "camera" else ' ! videoconvert'
+                output_format_str = ''
+
             if stream_types_list[i] == "file":
-                gscam_config_list[i] = f"filesrc location={stream_sources_list[i]} ! decodebin ! videoconvert ! {format}"
+                gscam_config_list[i] = (f"filesrc location={stream_sources_list[i]} ! decodebin{video_convert_str} ! "
+                                        f"videoscale ! videorate ! {input_codec}{video_properties} "
+                                        f"{jpeg_config}{mjpg_config}{video_convert_str}{output_format_str}"
+                                        )
             elif stream_types_list[i] == "rtsp":
-                gscam_config_list[i] = f"rtspsrc location={stream_sources_list[i]} latency=50 ! decodebin ! videoconvert ! x264enc ! mp4mux sync=false"
+                gscam_config_list[i] = (f"rtspsrc location={stream_sources_list[i]} do-retransmission=false latency=100 buffer-mode=auto ! decodebin{video_convert_str} ! "
+                                        f"videoscale ! {input_codec}{width_string}{height_string} "
+                                        f"{jpeg_config}{mjpg_config}{video_convert_str}{output_format_str}")
             elif stream_types_list[i] == "camera":
-                gscam_config_list[i] = f"v4l2src do-timestamp=true !  device={stream_sources_list[i]} ! {format} ! videoconvert"
+                gscam_config_list[i] = (f"v4l2src {timestamp_config_string} device={stream_sources_list[i]} ! "
+                                        f"{input_codec}{video_properties} "
+                                        f"{jpeg_config}{mjpg_config}{video_convert_str}{output_format_str}")
+
+        # Handle launch arguments
+        prepend_global_namespace = ''
+        if use_global_namespace_str.lower() == "true":
+            prepend_global_namespace = global_namespace_str.rstrip('/') + '/'
+
+        # if save_videos_str.lower() == "true":
+        #     # since the GSCam package does not support output sinks, we will use my package ros_images_to_files
+        #     mux_type = mux_types.get(video_save_filenames_list[i][-4:], 'matroskamux')
+        #     gscam_config_list[i] += (f' ! x264enc ! {mux_type} ! filesink location={video_save_filenames_list[i]} '
+        #                              f'async=false')
+
+        # Cleanup the pipeline
+        gscam_config_list[i] = clean_gstreamer_pipeline(gscam_config_list[i])
 
         # Generate gscam node
+        gscam_parameters = {
+            'frame_id': frame_ids_list[i],
+            'camera_info_url': 'file://' + camera_info_files_list[i].strip(),
+            'use_sim_time': use_sim_time,
+            'gscam_config': gscam_config_list[i],
+            'reopen_on_eof': loop,
+            'sync_sink': sync_sink,
+            'use_gst_timestamps': use_gst_timestamps,
+            'use_sensor_data_qos': use_sensor_data_qos,
+            'image_encoding': image_encoding
+        }
         gscam_node = Node(
-            package='gscam',
-            executable='gscam_node',
-            name='gscam_' + str(i),
-            namespace=namespaces_list[i].strip(),
-            output='screen',
-            parameters=[{
-                'frame_id': frame_ids_list[i],
-                'camera_info_url': 'file://' + camera_info_files_list[i].strip(),
-                'use_sim_time': use_sim_time,
-                'gscam_config': gscam_config_list[i],
-                'reopen_on_eof': loop,
-                'sync_sink': sync_sink,
-                'use_gst_timestamps': use_gst_timestamps,
-                'use_sensor_data_qos': use_sensor_data_qos,
-                'image_encoding': image_encoding
-            }],
+                package='gscam',
+                executable='gscam_node',
+                name='gscam_' + str(i),
+                namespace=prepend_global_namespace + namespaces_list[i].strip().lstrip('/'),
+                output='screen',
+                parameters=[
+                    gscam_parameters,
+                ],
         )
         nodes_to_launch.append(gscam_node)
 
-    # # Generate autodriver_image_object_detection nodes
-    # for i in range(num_cameras_int):
-    #     nodes_to_launch += [{
-    #         'package': 'autodriver_image_object_detection',
-    #         'executable': 'yolo_detector',  # yolo_detection_node
-    #         'name': 'yolo_detection_node_' + str(i),
-    #         'namespace': namespaces_list[i],
-    #         'output': 'screen',
-    #         'parameters': [{
-    #             'use_sim_time': use_sim_time,
-    #             'frame_id': frame_ids_list[i],
-    #             'num_cameras': num_cameras,
-    #             'namespaces': namespaces,
-    #             'camera_info_files': camera_info_files,
-    #         }],
-    #     }]
+        image_topic_is_compressed = False
+        image_topic = 'camera/image_raw'
+        if image_encoding_str == "jpeg":
+            image_topic_is_compressed = True
+            image_topic += '/compressed'
+
+        # Launch video recording via my ros_images_to_files package since gscam does not support output sinks
+        if save_videos_str.lower() == "true":
+            video_record_topic = image_topic
+            output_file_name = video_save_filenames_list[i]
+            try:
+                # search for the package and catch the exception if it does not exist
+                ros_images_to_file_spackage_share_dir = get_package_share_directory('ros_images_to_files')
+                video_recorder_node = Node(
+                        package='ros_images_to_files',
+                        executable='video_recorder_node',
+                        name='video_recorder_' + str(i),
+                        namespace=prepend_global_namespace + namespaces_list[i].strip().lstrip('/'),
+                        output='screen',
+                        parameters=[
+                            {'use_sim_time': use_sim_time},
+                            {'image_topic': video_record_topic},
+                            {'image_topic_is_compressed': image_topic_is_compressed},
+                            {'output_file_name': output_file_name},
+                            {'queue_size': 100},
+                            {'fps': float(fps_list[i]) if fps_list[i] > 0 else 30.0},
+                            {'qos': 'SENSOR_DATA' if use_sensor_data_qos_str.lower() == "true" else 'SYSTEM_DEFAULT'},
+                            {'show_image': False},
+                        ]
+                )
+                nodes_to_launch.append(video_recorder_node)
+            except ROS2PackageNotFoundError as e:
+                error_msg = LogInfo(msg=f'Failed to launch video_recorder_node: {e}. Skipping video recording.')
+                nodes_to_launch.append(error_msg)
+
+    # Generate autodriver_image_object_detection nodes
+        yolo_node = Node(
+            package= 'autodriver_image_object_detection',
+            executable= 'single_stream_detector',  # yolo_detector
+            name= 'yolo_detection_node_' + str(i),
+            namespace= prepend_global_namespace + namespaces_list[i].strip().lstrip('/'),
+            output= 'screen',
+            parameters= [
+                {
+                    'use_sim_time': use_sim_time,
+                    'input_image_topic': image_topic,
+                    'input_camera_info_topic': 'camera/camera_info',
+                    'input_image_topic_is_compressed': image_topic_is_compressed,
+                    'detection_results_topic': 'yolo/detection_results',
+                    'publish_debug_image': True,
+                    'detection_image_topic': 'yolo/detection_image',
+                    'segmentation_image_topic': 'yolo/segmentation_image',
+                    'segmentation_mask_image_topic': 'yolo/segmentation_mask_image',
+                    'qos': 'SENSOR_DATA' if use_sensor_data_qos_str.lower() == "true" else 'SYSTEM_DEFAULT',
+                    'model_path': "yolov8m-seg.pt",
+                    'show_image': False,
+                    'project_to_3d': False,
+                    'use_depth': False,
+                    'use_pointcloud': False
+                }
+            ]
+        )
+        nodes_to_launch.append(yolo_node)
 
     # return the launch description
-    ld = launch_args + nodes_to_launch
+    camera_group = GroupAction(
+            actions=[
+                SetParameter(name='use_sim_time', value=use_sim_time),
+                # nodes
+                *nodes_to_launch
+            ]
+    )
+    ld = launch_args + [camera_group]
     return ld
 
 

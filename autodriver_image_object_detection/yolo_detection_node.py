@@ -4,7 +4,7 @@ Publishes clustered pointcloud, visualization markers, and object array.
 
 Usage:
     sudo apt-get install ros-${ROS_DISTRO}-derived-object-msgs ros-${ROS_DISTRO}-vision-msgs
-    ros2 run pointcloud_obstacle_detection euclidean_clustering_node
+    ros2 run autodriver_image_object_detection yolo_detection_node
 
 1. Subscribe to image, pointcloud, depth using message filters
 2. Detect obstacles using YOLO [done]
@@ -81,6 +81,19 @@ try:
     import open3d.core as o3c
 except ImportError:
     pass
+
+
+def pack_2d_detection(x, y, size_x, size_y, class_id, conf):
+    detection = Detection2D()
+    detection.bbox.center.position.x = float(x)
+    detection.bbox.center.position.y = float(y)
+    detection.bbox.size_x = float(size_x)
+    detection.bbox.size_y = float(size_y)
+    hypothesis = ObjectHypothesisWithPose()
+    hypothesis.hypothesis.class_id = class_id
+    hypothesis.hypothesis.score = float(conf)
+    detection.results.append(hypothesis)
+    return detection
 
 
 class ImageObstacleDetectionNode(Node):
@@ -235,16 +248,27 @@ class ImageObstacleDetectionNode(Node):
         self.min_cluster_size = self.get_parameter("min_cluster_size").get_parameter_value().integer_value
         self.bounding_box_type = self.get_parameter("bounding_box_type").value
 
+        # optionally append /compressed to detection and segmentation topics if not in the strings
+        if self.input_image_topic_is_compressed:
+            if not self.detection_image_topic.endswith("/compressed"):
+                self.detection_image_topic = self.detection_image_topic + "/compressed"
+            if not self.segmentation_image_topic.endswith("/compressed"):
+                self.segmentation_image_topic = self.segmentation_image_topic + "/compressed"
+            if not self.segmentation_mask_image_topic.endswith("/compressed"):
+                self.segmentation_mask_image_topic = self.segmentation_mask_image_topic + "/compressed"
+
         # Setup the device
         self.device = 'cpu'
         self.torch_device = torch.device('cpu')
-        self.o3d_device = o3d.core.Device('CPU:0')
+        if self.project_to_3d and self.use_pointcloud:
+            self.o3d_device = o3d.core.Device('CPU:0')
         if self.use_gpu:
             if torch.cuda.is_available():
                 self.device = 'cuda:0'
                 self.torch_device = torch.device('cuda:0')
-                if o3d.core.cuda.is_available():
-                    self.o3d_device = o3d.core.Device('CUDA:0')
+                if self.project_to_3d and self.use_pointcloud:
+                    if o3d.core.cuda.is_available():
+                        self.o3d_device = o3d.core.Device('CUDA:0')
 
         # Initialize variables
         self.image_frame_id = None
@@ -395,13 +419,14 @@ class ImageObstacleDetectionNode(Node):
             is_depth = False
             for camera in self.cameras:
                 img_msg = msg[0] if camera == 'rgb' else msg[2]
-                cv_image, msg_encoding, image_frame_id, msg_timestamp, msg_fmt, conversion, inverse_conversion, is_color, is_depth = self.parse_image_message(img_msg)
+                cv_image, msg_encoding, image_frame_id, msg_timestamp, msg_fmt, conversion, inverse_conversion, is_color, is_depth, compressed_msg_codec = self.parse_image_message(img_msg)
                 self.frame_ids[camera] = image_frame_id
                 self.headers[camera] = img_msg.header
                 self.msg_metadata[camera] = {'msg_encoding': msg_encoding, 'msg_timestamp': msg_timestamp,
                                              'msg_fmt': msg_fmt, 'conversion': conversion,
                                              'inverse_conversion': inverse_conversion,
-                                             'is_color': is_color, 'is_depth': is_depth}
+                                             'is_color': is_color, 'is_depth': is_depth,
+                                             'compressed_msg_codec': compressed_msg_codec}
 
                 if camera == 'rgb':
                     # get image dimensions
@@ -452,29 +477,29 @@ class ImageObstacleDetectionNode(Node):
 
             # convert OpenCV image back to the input msg_fmt
             if detection_image is not None:
-                if self.msg_metadata['rgb'].get('conversion', None) is not None:
-                    detection_image = cv2.cvtColor(detection_image, self.msg_metadata['rgb'].get('inverse_conversion'))
-
-                if self.image_message_format in ("compressed", "packet"):
-                    detection_image_msg = self.bridge.compressed_imgmsg_to_cv2(
-                            detection_image,
-                            desired_encoding=self.msg_metadata['rgb'].get('msg_fmt'))
-                else:
-                    detection_image_msg = self.bridge.cv2_to_imgmsg(
-                            detection_image,
-                            encoding=self.msg_metadata['rgb'].get('msg_fmt'))
-
-                detection_image_msg.header.frame_id = self.frame_ids['rgb']
-                detection_image_msg.header.stamp = self.headers['rgb'].stamp
-
                 if self.publish_debug_image:
+                    if self.msg_metadata['rgb'].get('conversion', None) is not None:
+                        detection_image = cv2.cvtColor(detection_image, self.msg_metadata['rgb'].get('inverse_conversion'))
+
+                    if self.image_message_format in ("compressed", "packet"):
+                        detection_image_msg = self.bridge.cv2_to_compressed_imgmsg(
+                                detection_image,
+                                dst_format=self.msg_metadata['rgb'].get('compressed_msg_codec'))  # msg.format.split(';')[1].split()[0]
+                    else:
+                        detection_image_msg = self.bridge.cv2_to_imgmsg(
+                                detection_image,
+                                encoding=self.msg_metadata['rgb'].get('msg_fmt'))
+
+                    detection_image_msg.header.frame_id = self.frame_ids['rgb']
+                    detection_image_msg.header.stamp = self.headers['rgb'].stamp
+
                     if self.detection_image_topic:
                         self.detection_image_pub.publish(detection_image_msg)
                     if self.segmentation_mask_image_topic and (mask_img is not None):
                         if self.image_message_format in ("compressed", "packet"):
                             mask_image_msg = self.bridge.cv2_to_compressed_imgmsg(
                                     mask_img,
-                                    desired_encoding="mono8")
+                                    dst_format=self.msg_metadata['rgb'].get('compressed_msg_codec'))  # msg.format.split(';')[1].split()[0]
                         else:
                             mask_image_msg = self.bridge.cv2_to_imgmsg(
                                     mask_img,
@@ -486,16 +511,16 @@ class ImageObstacleDetectionNode(Node):
 
                     if self.segmentation_image_topic and (mask_img is not None):
                         # color_mask_img = cv2.cvtColor(mask_img, cv2.COLOR_GRAY2BGR)
-                        # todo: show the image and find why the channels are inverted. get the color image before its inverted and published
-                        color_mask_img = cv2.bitwise_and(self.images['rgb'], self.images['rgb'], mask=mask_img)
+                        cv_image_inverted = cv2.cvtColor(self.images['rgb'], self.msg_metadata['rgb'].get('inverse_conversion'))
+                        color_mask_img = cv2.bitwise_and(cv_image_inverted, cv_image_inverted, mask=mask_img)
                         if self.show_image:
                             cv2.imshow("color_mask_image", color_mask_img)
                             cv2.waitKey(1)
 
                         if self.image_message_format in ("compressed", "packet"):
-                            color_mask_image_msg = self.bridge.compressed_imgmsg_to_cv2(
+                            color_mask_image_msg = self.bridge.cv2_to_compressed_imgmsg(
                                     color_mask_img,
-                                    desired_encoding=self.msg_metadata['rgb'].get('msg_fmt'))
+                                    dst_format=self.msg_metadata['rgb'].get('compressed_msg_codec'))  # msg.format.split(';')[1].split()[0]
                         else:
                             color_mask_image_msg = self.bridge.cv2_to_imgmsg(
                                     color_mask_img,
@@ -511,12 +536,23 @@ class ImageObstacleDetectionNode(Node):
     def parse_image_message(self, msg):
         image_frame_id = msg.header.frame_id
         msg_timestamp = msg.header.stamp
-        msg_encoding = msg.encoding
         msg_fmt = "bgr8"
+        compressed_msg_codec = None
         conversion = None
         inverse_conversion = None
         is_color = True
         is_depth = False
+        if self.image_message_format == "raw":
+            msg_encoding = msg.encoding
+
+        elif self.image_message_format == 'compressed':
+            # format: rgb8; jpeg compressed bgr8
+            msg_info = msg.format
+            msg_encoding_split = msg_info.split(';')
+            uncompressed_msg_fmt = msg_encoding_split[0]
+            compressed_img_info = msg_encoding_split[1].split()
+            compressed_msg_codec = compressed_img_info[0]
+            msg_encoding = compressed_img_info[-1]
 
         # set the desired output encoding
         # (http://wiki.ros.org/cv_bridge/Tutorials/UsingCvBridgeToConvertBetweenROSImagesAndOpenCVImages#cv_bridge.2FTutorials.2FUsingCvBridgeCppDiamondback.Converting_ROS_image_messages_to_OpenCV_images)
@@ -561,7 +597,7 @@ class ImageObstacleDetectionNode(Node):
         if conversion is not None:
             cv_image = cv2.cvtColor(cv_image, conversion)
         return (cv_image, msg_encoding, image_frame_id, msg_timestamp, msg_fmt, conversion, inverse_conversion,
-                is_color, is_depth)
+                is_color, is_depth, compressed_msg_codec)
 
     def unpack_pointcloud_message(self, ros_cloud):
         frame_id = ros_cloud.header.frame_id
@@ -705,7 +741,7 @@ class ImageObstacleDetectionNode(Node):
                         show=False,
                         tracker=self.tracker_2d,
                         persist=True,
-                        stream=True
+                        stream=False
                 )
             else:
                 # https://docs.ultralytics.com/modes/predict/#inference-arguments
@@ -720,7 +756,7 @@ class ImageObstacleDetectionNode(Node):
                         # max_det=self.max_det,
                         retina_masks=True,
                         show=False,
-                        stream=True
+                        stream=False
                 )
 
                 # # or control each step (predict/track does all three steps)
@@ -830,7 +866,7 @@ class ImageObstacleDetectionNode(Node):
                 track_id = box.id.int().cpu().item() if box.id is not None else -1
 
                 # pack 2D detection results
-                detection_2d = self.pack_2d_detection(
+                detection_2d = pack_2d_detection(
                     bbox[0], bbox[1], bbox[2], bbox[3], result.names.get(int(cls)), conf)
                 detections_msg.detections.append(detection_2d)
 
@@ -890,18 +926,6 @@ class ImageObstacleDetectionNode(Node):
                     self.detection3d_pointcloud_results_pub.publish(detection3d_pointcloud_array)
                     self.marker_pointcloud_pub.publish(marker_pointcloud_array)
         return detections_msg, mask_img
-
-    def pack_2d_detection(self, x, y, size_x, size_y, class_id, conf):
-        detection = Detection2D()
-        detection.bbox.center.position.x = float(x)
-        detection.bbox.center.position.y = float(y)
-        detection.bbox.size_x = float(size_x)
-        detection.bbox.size_y = float(size_y)
-        hypothesis = ObjectHypothesisWithPose()
-        hypothesis.hypothesis.class_id = class_id
-        hypothesis.hypothesis.score = float(conf)
-        detection.results.append(hypothesis)
-        return detection
 
     def project_to_3d_with_depth(self, mask, xywh, depth_image):
         """

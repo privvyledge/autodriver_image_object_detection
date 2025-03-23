@@ -245,7 +245,7 @@ RUN sudo apt-get update && \
     cd ${HOME} && git clone https://github.com/ultralytics/ultralytics -b ${ULTRALYTICS_VERSION} && \
     cd ultralytics && \
     python3.10 -m pip install --upgrade pip wheel "setuptools==70.0.0" && \
-    cd ${HOME}/ultralytics/ && python3.10 -m pip install -e ".[export]" && \
+    cd ${HOME}/ultralytics/ && python3.10 -m pip install -e ".[export]" "lap>=0.5.12" && \
     python3.10 -m pip install "numpy==1.26.4" && \
     sudo rm -rf /var/lib/apt/lists/*
 
