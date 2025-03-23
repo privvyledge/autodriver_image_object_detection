@@ -575,11 +575,10 @@ def launch_setup(context, *args, **kwargs):
                     'segmentation_image_topic': 'yolo/segmentation_image',
                     'segmentation_mask_image_topic': 'yolo/segmentation_mask_image',
                     'qos': 'SENSOR_DATA' if use_sensor_data_qos_str.lower() == "true" else 'SYSTEM_DEFAULT',
-                    'model_path': "yolov8m-seg.pt",
+                    'model_path': "yolo11m-seg.engine",
+                    'export_model_format': '',
+                    'use_image_dimensions': True,
                     'show_image': False,
-                    'project_to_3d': False,
-                    'use_depth': False,
-                    'use_pointcloud': False
                 }
             ]
         )

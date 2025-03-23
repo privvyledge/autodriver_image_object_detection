@@ -96,6 +96,13 @@ class SingleStreamDetector(Node):
                                descriptor=ParameterDescriptor(
                                        description='',
                                        type=ParameterType.PARAMETER_STRING))
+        self.declare_parameter(name='export_model_format', value='',
+                               descriptor=ParameterDescriptor(
+                                       description='Export the model to one of the supported formats '
+                                                   'if the file does not exist. '
+                                                   'See https://docs.ultralytics.com/modes/export/#export-formats '
+                                                   'for supported formats.',
+                               type=ParameterType.PARAMETER_BOOL))
         self.declare_parameter('track_2d', True)
         self.declare_parameter('tracker_2d', 'bytetrack.yaml')
         self.declare_parameter('queue_size', 1)
@@ -103,7 +110,16 @@ class SingleStreamDetector(Node):
         self.declare_parameter(name='show_image', value=False, descriptor=ParameterDescriptor(
                 description='',
                 type=ParameterType.PARAMETER_BOOL))
-        self.declare_parameter("use_image_dimensions", True)
+        self.declare_parameter(name="use_image_dimensions", value=True, descriptor=ParameterDescriptor(
+                description='Whether to use the image dimensions when running inference or using a fixed square image '
+                            'size for the model. Setting to True typically yields better performance.',
+                type=ParameterType.PARAMETER_BOOL))
+        self.declare_parameter(name="image_dimensions", value=(480, 640), descriptor=ParameterDescriptor(
+                description='The image dimensions to use when running inference. '
+                            'Must be set if exporting the model to another format, '
+                            'e.g TensorRT .engine since that is compiled with a fixed size.',
+                type=ParameterType.PARAMETER_INTEGER_ARRAY
+        ))
         self.declare_parameter("resize_image", False)
         self.declare_parameter("half_precision", True)
         self.declare_parameter("conf_thresh", 0.25)
@@ -124,12 +140,14 @@ class SingleStreamDetector(Node):
         self.segmentation_mask_image_topic = self.get_parameter('segmentation_mask_image_topic').get_parameter_value().string_value
         self.qos = self.get_parameter('qos').get_parameter_value().string_value
         self.model_path = self.get_parameter('model_path').get_parameter_value().string_value
+        self.export_model_format = self.get_parameter('export_model_format').get_parameter_value().string_value
         self.track_2d = self.get_parameter('track_2d').get_parameter_value().bool_value
         self.tracker_2d = self.get_parameter('tracker_2d').get_parameter_value().string_value
         self.queue_size = self.get_parameter('queue_size').get_parameter_value().integer_value
         self.use_gpu = self.get_parameter('use_gpu').get_parameter_value().bool_value
         self.show_image = self.get_parameter('show_image').get_parameter_value().bool_value
         self.use_image_dimensions = self.get_parameter("use_image_dimensions").get_parameter_value().bool_value
+        self.image_dimensions = self.get_parameter("image_dimensions").get_parameter_value().integer_array_value
         self.resize_image = self.get_parameter("resize_image").get_parameter_value().bool_value
         self.half_precision = self.get_parameter("half_precision").get_parameter_value().bool_value
         self.conf_thresh = self.get_parameter("conf_thresh").get_parameter_value().double_value
@@ -161,7 +179,45 @@ class SingleStreamDetector(Node):
         self.image_height = None
         self.imgsz = None
         self.bridge = CvBridge()
+
+        imgsz = self.image_dimensions if self.use_image_dimensions else (640, 640)
+        # (optional) export the model
+        if self.export_model_format:
+            self.get_logger().info(f"Exporting model to {self.export_model_format} format...")
+            self.model = YOLO(self.model_path.split('.')[0] + '.pt')  # can only export pytorch models
+            self.model.export(
+                    format=self.export_model_format, half=self.half_precision, simplify=True, nms=True,
+                    # imgsz=tuple(imgsz),  # not necessary if dynamic=True
+                    dynamic=True,
+                    device=self.device
+            )
+
+            self.get_logger().info(f"Exported model to {self.export_model_format} format: {self.model_path}")
+            self.model_path = self.model_path.split('.')[:-1] + '.' + self.export_model_format
+
+        # if model_path ends with .engine or .onnx, try loading the file and export if FileNotFoundError
+        if self.model_path.split('.')[-1] in ['engine', 'onnx']:
+            try:
+                self.model = YOLO(self.model_path)
+            except FileNotFoundError:
+                self.get_logger().info(f"Model not found: {self.model_path}. "
+                                       f"Trying to export to {self.model_path.split('.')[-1]}.")
+
+                self.model = YOLO(self.model_path.split('.')[0] + '.pt')  # append .pt to the model path
+                self.model.export(
+                        format=self.model_path.split('.')[-1],
+                        half=self.half_precision,
+                        simplify=True,
+                        nms=True,
+                        # imgsz=tuple(imgsz),  # not necessary if dynamic=True
+                        dynamic=True,
+                        device=self.device
+                )
+                self.model_path = self.model_path.split('.')[0] + '.' + self.model_path.split('.')[-1]
+
+        # Initialize model
         self.model = YOLO(self.model_path)
+
         self.use_segmentation = self.model_path.endswith("-seg.pt")
         self.results = None
         self.detection_image = None
@@ -172,7 +228,7 @@ class SingleStreamDetector(Node):
             self.get_logger().info("Fusing model...")
             self.model.fuse()
         except TypeError as e:
-            self.get_logger().warn(f"Error while fuse: {e}. "
+            self.get_logger().warn(f"Error while fusing the model: {e}. "
                                    f"This usually occurs if not using a pytorch model (.pt), "
                                    f"e.g a TensorRT model (.engine)")
 
