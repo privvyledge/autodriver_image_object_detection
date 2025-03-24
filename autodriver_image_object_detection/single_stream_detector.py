@@ -92,7 +92,7 @@ class SingleStreamDetector(Node):
         self.declare_parameter(name='qos', value="SENSOR_DATA", descriptor=ParameterDescriptor(
                 description='',
                 type=ParameterType.PARAMETER_STRING))
-        self.declare_parameter(name='model_path', value="yolo11n-seg.pt",
+        self.declare_parameter(name='model_path', value="yolo11n-seg.engine",
                                descriptor=ParameterDescriptor(
                                        description='',
                                        type=ParameterType.PARAMETER_STRING))
@@ -103,7 +103,7 @@ class SingleStreamDetector(Node):
                                                    'See https://docs.ultralytics.com/modes/export/#export-formats '
                                                    'for supported formats.',
                                type=ParameterType.PARAMETER_BOOL))
-        self.declare_parameter('track_2d', True)
+        self.declare_parameter('track_2d', False)
         self.declare_parameter('tracker_2d', 'bytetrack.yaml')
         self.declare_parameter('queue_size', 1)
         self.declare_parameter('use_gpu', True)
@@ -155,15 +155,6 @@ class SingleStreamDetector(Node):
         self.max_det = self.get_parameter("max_det").get_parameter_value().integer_value
         self.classes = self.get_parameter("classes").get_parameter_value().integer_array_value
         self.static_camera_info = self.get_parameter('static_camera_info').get_parameter_value().bool_value
-
-        # optionally append /compressed to detection and segmentation topics if not in the strings
-        if self.input_image_topic_is_compressed:
-            if not self.detection_image_topic.endswith("/compressed"):
-                self.detection_image_topic = self.detection_image_topic + "/compressed"
-            if not self.segmentation_image_topic.endswith("/compressed"):
-                self.segmentation_image_topic = self.segmentation_image_topic + "/compressed"
-            if not self.segmentation_mask_image_topic.endswith("/compressed"):
-                self.segmentation_mask_image_topic = self.segmentation_mask_image_topic + "/compressed"
 
         # Setup the device
         self.device = 'cpu'
@@ -231,6 +222,17 @@ class SingleStreamDetector(Node):
             self.get_logger().warn(f"Error while fusing the model: {e}. "
                                    f"This usually occurs if not using a pytorch model (.pt), "
                                    f"e.g a TensorRT model (.engine)")
+
+        # optionally append /compressed to detection and segmentation topics if not in the strings
+        if self.input_image_topic_is_compressed:
+            if not self.input_image_topic.endswith("/compressed"):
+                self.input_image_topic = self.input_image_topic + "/compressed"
+            if not self.detection_image_topic.endswith("/compressed"):
+                self.detection_image_topic = self.detection_image_topic + "/compressed"
+            if not self.segmentation_image_topic.endswith("/compressed"):
+                self.segmentation_image_topic = self.segmentation_image_topic + "/compressed"
+            if not self.segmentation_mask_image_topic.endswith("/compressed"):
+                self.segmentation_mask_image_topic = self.segmentation_mask_image_topic + "/compressed"
 
         # setup QoS
         qos_profile = QoSProfile(

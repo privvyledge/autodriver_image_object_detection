@@ -406,6 +406,7 @@ def launch_setup(context, *args, **kwargs):
     # Generate gscam nodes
     nodes_to_launch = []
 
+    multi_stream_remappings = []
     for i in range(num_cameras_int):
         # If the config is empty, use stream sources to choose
         if gscam_config_list[i] == "":
@@ -556,7 +557,7 @@ def launch_setup(context, *args, **kwargs):
                 error_msg = LogInfo(msg=f'Failed to launch video_recorder_node: {e}. Skipping video recording.')
                 nodes_to_launch.append(error_msg)
 
-    # Generate autodriver_image_object_detection nodes
+        # Generate autodriver_image_object_detection nodes
         yolo_node = Node(
             package= 'autodriver_image_object_detection',
             executable= 'single_stream_detector',  # yolo_detector
@@ -578,11 +579,59 @@ def launch_setup(context, *args, **kwargs):
                     'model_path': "yolo11m-seg.engine",
                     'export_model_format': '',
                     'use_image_dimensions': True,
+                    'use_gpu': True,
                     'show_image': False,
                 }
             ]
         )
         nodes_to_launch.append(yolo_node)
+
+        multi_stream_remappings.append((f'stream_{i}/image_raw', f"{namespaces_list[i].strip().lstrip('/')}/camera/image_raw"))
+        multi_stream_remappings.append((f'stream_{i}/camera_info', f"{namespaces_list[i].strip().lstrip('/')}/camera/camera_info"))
+
+        # add tracking node
+        tracking_node = Node(
+                package='autodriver_image_object_detection',
+                executable='tracking_node_2d',
+                name='tracking_node_' + str(i),
+                namespace=prepend_global_namespace,
+                output='screen',
+                parameters=[
+                    {
+                        'use_sim_time': use_sim_time,
+                    }
+                ],
+                remappings=[
+                    ("image_raw", f"{namespaces_list[i].strip().lstrip('/')}/camera/image_raw"),
+                    ("detections_2d", f"stream_{i}/yolo/detection/results"),
+                    ("tracked_detections_2d", "tracked_detections_2d_" + str(i))
+                ]
+        )
+        nodes_to_launch.append(tracking_node)
+
+    # multi stream detector
+    multi_yolo_node = Node(
+            package='autodriver_image_object_detection',
+            executable='multi_stream_detector',  # yolo_detector
+            name='multi_yolo_detection_node',
+            namespace=prepend_global_namespace,
+            output='screen',
+            parameters=[
+                {
+                    'use_sim_time': use_sim_time,
+                    'num_cameras': num_cameras,
+                    'synchronization_interval': 0.1,
+                    'input_image_topic_is_compressed': [False] * num_cameras_int,
+                    'qos': 'SENSOR_DATA' if use_sensor_data_qos_str.lower() == "true" else 'SYSTEM_DEFAULT',
+                    'model_path': "yolo11m-seg.engine",
+                    'export_model_format': '',
+                    'use_gpu': True,
+                    'show_image': False,
+                }
+            ],
+            remappings=multi_stream_remappings
+    )
+    nodes_to_launch.append(multi_yolo_node)
 
     # return the launch description
     camera_group = GroupAction(

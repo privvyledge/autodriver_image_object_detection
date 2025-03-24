@@ -147,7 +147,7 @@ class ImageObstacleDetectionNode(Node):
         self.declare_parameter(name='qos', value="SENSOR_DATA", descriptor=ParameterDescriptor(
                 description='',
                 type=ParameterType.PARAMETER_STRING))
-        self.declare_parameter(name='model_path', value="yolov8m-seg.pt",
+        self.declare_parameter(name='model_path', value="yolov8m-seg.engine",
                                descriptor=ParameterDescriptor(
                                        description='',
                                        type=ParameterType.PARAMETER_STRING))
@@ -266,15 +266,6 @@ class ImageObstacleDetectionNode(Node):
         self.min_cluster_size = self.get_parameter("min_cluster_size").get_parameter_value().integer_value
         self.bounding_box_type = self.get_parameter("bounding_box_type").value
 
-        # optionally append /compressed to detection and segmentation topics if not in the strings
-        if self.input_image_topic_is_compressed:
-            if not self.detection_image_topic.endswith("/compressed"):
-                self.detection_image_topic = self.detection_image_topic + "/compressed"
-            if not self.segmentation_image_topic.endswith("/compressed"):
-                self.segmentation_image_topic = self.segmentation_image_topic + "/compressed"
-            if not self.segmentation_mask_image_topic.endswith("/compressed"):
-                self.segmentation_mask_image_topic = self.segmentation_mask_image_topic + "/compressed"
-
         # Setup the device
         self.device = 'cpu'
         self.torch_device = torch.device('cpu')
@@ -369,6 +360,17 @@ class ImageObstacleDetectionNode(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
+        # optionally append /compressed to detection and segmentation topics if not in the strings
+        if self.input_image_topic_is_compressed:
+            if not self.input_image_topic.endswith("/compressed"):
+                self.input_image_topic = self.input_image_topic + "/compressed"
+            if not self.detection_image_topic.endswith("/compressed"):
+                self.detection_image_topic = self.detection_image_topic + "/compressed"
+            if not self.segmentation_image_topic.endswith("/compressed"):
+                self.segmentation_image_topic = self.segmentation_image_topic + "/compressed"
+            if not self.segmentation_mask_image_topic.endswith("/compressed"):
+                self.segmentation_mask_image_topic = self.segmentation_mask_image_topic + "/compressed"
+
         # setup QoS
         qos_profile = QoSProfile(
                 reliability=QoSReliabilityPolicy.RELIABLE,
@@ -445,8 +447,8 @@ class ImageObstacleDetectionNode(Node):
         # # Timers
         # self.timer = self.create_timer(0.1, self.timer_callback)
         # self.timer_count = 0
-
         self.get_logger().info(f"image_obstacle_detection_node node started on device: {self.device}")
+
 
     def detection_callback(self, *msg):
         """
