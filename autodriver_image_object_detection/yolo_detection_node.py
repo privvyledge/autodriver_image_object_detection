@@ -45,6 +45,7 @@ Todo:
 import time
 import uuid
 import struct
+from collections import defaultdict
 import rclpy
 from rclpy.node import Node
 from rclpy.parameter import Parameter
@@ -237,6 +238,7 @@ class ImageObstacleDetectionNode(Node):
         self.declare_parameter('track_2d', True)
         self.declare_parameter('track_3d', True)  # todo: implement 3D tracking
         self.declare_parameter('tracker_2d', 'bytetrack.yaml')
+        self.declare_parameter('plot_tracks', True)
         self.declare_parameter('queue_size', 1)
         self.declare_parameter('synchronization_interval', 0.1)
         self.declare_parameter('use_gpu', True)
@@ -305,6 +307,7 @@ class ImageObstacleDetectionNode(Node):
         self.track_2d = self.get_parameter('track_2d').value
         self.track_3d = self.get_parameter('track_3d').value
         self.tracker_2d = self.get_parameter('tracker_2d').value
+        self.plot_tracks = self.get_parameter('plot_tracks').value
         self.queue_size = self.get_parameter('queue_size').value
         self.synchronization_interval = self.get_parameter('synchronization_interval').value
         self.use_gpu = self.get_parameter('use_gpu').value
@@ -361,6 +364,10 @@ class ImageObstacleDetectionNode(Node):
         self.image_height = None
         self.imgsz = None
         self.bridge = CvBridge()
+
+        if self.plot_tracks:
+            # Store the track history
+            self.track_history = defaultdict(lambda: [])
 
         model_architectures = {
             'yolo': ultralytics.YOLO,  # yolov8n-seg.pt, yolo11n-seg.pt, YOLO12n-seg.pt, yoloe-s.pt
@@ -1063,10 +1070,22 @@ class ImageObstacleDetectionNode(Node):
 
                 # preprocess
                 bbox = box.xywh.cpu().numpy().flatten()
+                x, y, w, h = bbox
                 if mask is not None:
                     # mask = mask.cpu().numpy()
                     mask_xy = mask.xy[0]
                 track_id = box.id.int().cpu().item() if box.id is not None else -1
+
+                if self.track_2d and self.plot_tracks:
+                    track = self.track_history[track_id]
+                    track.append((float(x), float(y)))  # x, y center point
+                    if len(track) > 30:  # retain 30 tracks for 30 frames
+                        track.pop(0)
+
+                    # Draw the tracking lines
+                    points = np.hstack(track).astype(np.int32).reshape((-1, 1, 2))
+                    cv2.polylines(self.detection_image, [points],
+                                  isClosed=False, color=(230, 230, 230), thickness=5)
 
                 # pack 2D detection results
                 detection_2d = pack_2d_detection(

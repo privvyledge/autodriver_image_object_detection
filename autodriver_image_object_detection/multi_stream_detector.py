@@ -12,6 +12,7 @@ Todo:
 import time
 import uuid
 import struct
+from collections import defaultdict
 import rclpy
 from rclpy.node import Node
 from rclpy.parameter import Parameter
@@ -163,6 +164,7 @@ class MultiStreamDetector(Node):
                                        type=ParameterType.PARAMETER_BOOL))
         self.declare_parameter('track_2d', False)
         self.declare_parameter('tracker_2d', 'bytetrack.yaml')
+        self.declare_parameter('plot_tracks', True)
         self.declare_parameter('queue_size', 1)
         self.declare_parameter('use_gpu', True)
         self.declare_parameter(name='show_image', value=False, descriptor=ParameterDescriptor(
@@ -198,6 +200,7 @@ class MultiStreamDetector(Node):
         self.export_model_format = self.get_parameter('export_model_format').get_parameter_value().string_value
         self.track_2d = self.get_parameter('track_2d').get_parameter_value().bool_value
         self.tracker_2d = self.get_parameter('tracker_2d').get_parameter_value().string_value
+        self.plot_tracks = self.get_parameter('plot_tracks').get_parameter_value().bool_value
         self.queue_size = self.get_parameter('queue_size').get_parameter_value().integer_value
         self.use_gpu = self.get_parameter('use_gpu').get_parameter_value().bool_value
         self.show_image = self.get_parameter('show_image').get_parameter_value().bool_value
@@ -315,6 +318,10 @@ class MultiStreamDetector(Node):
         self.image_widths = initial_dict.copy()
         self.image_heights = initial_dict.copy()
         self.imgszs = initial_dict.copy()
+
+        if self.plot_tracks:
+            # Store the track history
+            self.track_history = defaultdict(lambda: [])
 
         try:
             self.get_logger().info("Fusing model...")
@@ -705,10 +712,22 @@ class MultiStreamDetector(Node):
             # todo: speed up by avoiding this for-loop, e.g pass the bounding_boxes, masks and (depth/pointcloud) to the detection for loop
             # preprocess
             bbox = box.xywh.cpu().numpy().flatten()
+            x, y, w, h = bbox
             if mask is not None:
                 # mask = mask.cpu().numpy()
                 mask_xy = mask.xy[0]
             track_id = box.id.int().cpu().item() if box.id is not None else -1
+
+            if self.track_2d and self.plot_tracks:
+                track = self.track_history[track_id]
+                track.append((float(x), float(y)))  # x, y center point
+                if len(track) > 30:  # retain 30 tracks for 30 frames
+                    track.pop(0)
+
+                # Draw the tracking lines
+                points = np.hstack(track).astype(np.int32).reshape((-1, 1, 2))
+                cv2.polylines(detection_image, [points],
+                              isClosed=False, color=(230, 230, 230), thickness=5)
 
             # pack 2D detection results
             detection_2d = pack_2d_detection(
