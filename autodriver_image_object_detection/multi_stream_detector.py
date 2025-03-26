@@ -6,10 +6,11 @@ Usage:
     ros2 run autodriver_image_object_detection single_stream_detector
 
 Todo:
-    * add support for compressed images
+    * add support for publishing ObstacleArray and ObjectArray messages similar to single_stream_detector and yolo_detection_node
 """
 
 import time
+import uuid
 import struct
 import rclpy
 from rclpy.node import Node
@@ -31,6 +32,10 @@ from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point, Vector3, Pose, Quaternion
 from derived_object_msgs.msg import Object, ObjectArray
 from shape_msgs.msg import SolidPrimitive
+try:
+    from nav2_dynamic_msgs.msg import Obstacle, ObstacleArray
+except ImportError:
+    print("nav2_dynamic_msgs not found. ")
 import tf2_ros
 from tf2_ros import TransformBroadcaster, TransformListener, Buffer, LookupException, ConnectivityException, \
     ExtrapolationException
@@ -42,7 +47,7 @@ from cv_bridge import CvBridge
 import cv2
 import torch
 import torch.utils.dlpack
-from ultralytics import YOLO
+import ultralytics
 
 
 def pack_2d_detection(x, y, size_x, size_y, class_id, conf, id):
@@ -51,13 +56,31 @@ def pack_2d_detection(x, y, size_x, size_y, class_id, conf, id):
     detection.bbox.center.position.y = float(y)
     detection.bbox.size_x = float(size_x)
     detection.bbox.size_y = float(size_y)
-    detection.id = str(id)  # temporarily used to store the class int till I make a custom message.
+    detection.id = str(id)
     hypothesis = ObjectHypothesisWithPose()
     hypothesis.hypothesis.class_id = class_id
     hypothesis.hypothesis.score = float(conf)
     detection.results.append(hypothesis)
     return detection
 
+
+def pack_nav2_obstacle_msg(x, y, size_x, size_y, class_id, conf, id=None):
+    if id in (None, -1):
+        uuid_ = uuid.uuid4()
+    else:
+        uuid_ = uuid.UUID(int=id)
+        # or
+        #id_str = str(id)
+        #uuid_ = uuid.uuid5(uuid.NAMESPACE_DNS, id_str)
+
+    obstacle_msg = Obstacle()
+    obstacle_msg.uuid.uuid = list(uuid_.bytes)
+    obstacle_msg.score = float(conf)
+    obstacle_msg.position.x = float(x)
+    obstacle_msg.position.y = float(y)
+    obstacle_msg.size.x = float(size_x)
+    obstacle_msg.size.y = float(size_y)
+    return obstacle_msg
 
 
 class MultiStreamDetector(Node):
@@ -158,9 +181,9 @@ class MultiStreamDetector(Node):
         self.declare_parameter("resize_image", False)
         self.declare_parameter("half_precision", True)
         self.declare_parameter("conf_thresh", 0.25)
-        self.declare_parameter("iou_thresh", 0.5)
+        self.declare_parameter("iou_thresh", 0.7)
         self.declare_parameter("max_det", 300)
-        self.declare_parameter("classes", list(range(80)))
+        self.declare_parameter("classes", ['person', 'car'])  # [] or ['person', 'car'] or [0, 2]
         self.declare_parameter('static_camera_info', True)
         self.declare_parameter('subscribe_camera_info', False)
 
@@ -185,7 +208,7 @@ class MultiStreamDetector(Node):
         self.conf_thresh = self.get_parameter("conf_thresh").get_parameter_value().double_value
         self.iou_thresh = self.get_parameter("iou_thresh").get_parameter_value().double_value
         self.max_det = self.get_parameter("max_det").get_parameter_value().integer_value
-        self.classes = self.get_parameter("classes").get_parameter_value().integer_array_value
+        self.classes = self.get_parameter("classes").value
         self.static_camera_info = self.get_parameter('static_camera_info').get_parameter_value().bool_value
         self.subscribe_camera_info = self.get_parameter('subscribe_camera_info').get_parameter_value().bool_value
 
@@ -197,11 +220,27 @@ class MultiStreamDetector(Node):
                 self.device = 'cuda:0'
                 self.torch_device = torch.device('cuda:0')
 
+        model_architectures = {
+            'yolo': ultralytics.YOLO,  # yolov8n-seg.pt, yolo11n-seg.pt, YOLO12n-seg.pt, yoloe-s.pt
+            'rtdetr': ultralytics.RTDETR,  # rtdetr-l.pt
+            'nas': ultralytics.NAS,  # yolo_nas_s.pt
+            'worldv2': ultralytics.YOLOWorld,  # yolov8s-worldv2.pt
+        }
+
+        if 'rtdetr' in self.model_path:
+            model_class = model_architectures['rtdetr']
+        elif 'nas' in self.model_path:
+            model_class = model_architectures['nas']
+        elif 'worldv2' in self.model_path:
+            model_class = model_architectures['worldv2']
+        else:
+            model_class = model_architectures['yolo']
+
         imgsz = self.image_dimensions if self.use_image_dimensions else (640, 640)
         # (optional) export the model
         if self.export_model_format:
             self.get_logger().info(f"Exporting model to {self.export_model_format} format...")
-            self.model = YOLO(self.model_path.split('.')[0] + '.pt')  # can only export pytorch models
+            self.model = model_class(self.model_path.split('.')[0] + '.pt')  # can only export pytorch models
             self.model.export(
                     format=self.export_model_format, half=self.half_precision, simplify=True, nms=True,
                     # imgsz=tuple(imgsz),  # not necessary if dynamic=True
@@ -216,12 +255,12 @@ class MultiStreamDetector(Node):
         # if model_path ends with .engine or .onnx, try loading the file and export if FileNotFoundError
         if self.model_path.split('.')[-1] in ['engine', 'onnx']:
             try:
-                self.model = YOLO(self.model_path)
+                self.model = model_class(self.model_path)
             except FileNotFoundError:
                 self.get_logger().info(f"Model not found: {self.model_path}. "
                                        f"Trying to export to {self.model_path.split('.')[-1]}.")
 
-                self.model = YOLO(self.model_path.split('.')[0] + '.pt')  # append .pt to the model path
+                self.model = model_class(self.model_path.split('.')[0] + '.pt')  # append .pt to the model path
                 self.model.export(
                         format=self.model_path.split('.')[-1],
                         half=self.half_precision,
@@ -235,7 +274,29 @@ class MultiStreamDetector(Node):
                 self.model_path = self.model_path.split('.')[0] + '.' + self.model_path.split('.')[-1]
 
         # Initialize model
-        self.model = YOLO(self.model_path)
+        self.model = model_class(self.model_path)
+
+        # Filter classes
+        class_names = self.model.names
+        class_names_inv = {v: k for k, v in class_names.items()}
+        if len(self.classes) == 0:
+            self.classes = list(range(80))
+        else:
+            if isinstance(self.classes, int):
+                assert self.classes < 80
+                self.classes = [self.classes]
+            elif isinstance(self.classes, str):
+                self.classes = [int(x.strip()) for x in self.classes.split(',')]  # assert all ints less than 80
+                assert all(x < 80 for x in self.classes)
+            elif isinstance(self.classes, list):
+                if isinstance(self.classes[0], str):
+                    assert all(x in supported_class_names for x in self.classes)
+                    self.classes = [class_names_inv[x.strip()] for x in self.classes]
+            else:
+                self.classes = list(self.classes)
+
+        self.get_logger().info(f"Only detecting classes: {[class_names[class_] for class_ in self.classes]}")
+
         self.use_segmentation = self.model_path.endswith("-seg.pt")
 
         # Initialize variables
@@ -409,7 +470,6 @@ class MultiStreamDetector(Node):
                         mask_image_msg = self.bridge.cv2_to_imgmsg(
                                 mask_img,
                                 encoding="mono8")
-                        )
                         mask_image_msg.header = self.headers[self.cameras[i]]
                         self.publishers_[publisher_idx + 3].publish(mask_image_msg)  # segmentation mask image message
 
@@ -551,8 +611,8 @@ class MultiStreamDetector(Node):
                         imgsz=self.imgsz,
                         device=self.device,
                         half=self.half_precision,
-                        # classes=self.classes,
-                        # max_det=self.max_det,
+                        classes=self.classes,
+                        max_det=self.max_det,
                         retina_masks=True,
                         show=False,
                         tracker=self.tracker_2d,
@@ -568,8 +628,8 @@ class MultiStreamDetector(Node):
                         imgsz=self.imgsz,
                         device=self.device,
                         half=self.half_precision,
-                        # classes=self.classes,
-                        # max_det=self.max_det,
+                        classes=self.classes,
+                        max_det=self.max_det,
                         retina_masks=True,
                         show=False,
                         stream=False
@@ -612,10 +672,11 @@ class MultiStreamDetector(Node):
         if bounding_box.shape[0] < 1:
             return detections_msg, mask_img, detection_image
 
+        track_ids = None
         if self.track_2d:
             track_ids = result.boxes.id
             if track_ids is not None:
-                track_ids = track_ids.int().cpu().tolist()  # todo: add to message
+                track_ids = track_ids.int().cpu().tolist()
 
         if hasattr(result, "masks") and masks is not None:
             # mask_data = masks.data.cpu()  # masks drawn on the image [0-1] float. n x image_height x image_width
@@ -626,6 +687,10 @@ class MultiStreamDetector(Node):
             if self.show_image:
                 cv2.imshow("masked_image", mask_img)
                 cv2.waitKey(1)
+
+            else:
+                # create a list of Nones
+                masks = [None] * len(bounding_box)  # bounding_box.shape[0]
 
         if keypoints is not None:
             keypoints = keypoints.cpu()  # Keypoints object for pose outputs
@@ -640,12 +705,15 @@ class MultiStreamDetector(Node):
             # todo: speed up by avoiding this for-loop, e.g pass the bounding_boxes, masks and (depth/pointcloud) to the detection for loop
             # preprocess
             bbox = box.xywh.cpu().numpy().flatten()
-            mask_xy = mask.xy[0]
+            if mask is not None:
+                # mask = mask.cpu().numpy()
+                mask_xy = mask.xy[0]
             track_id = box.id.int().cpu().item() if box.id is not None else -1
 
             # pack 2D detection results
             detection_2d = pack_2d_detection(
-                bbox[0], bbox[1], bbox[2], bbox[3], result.names.get(int(cls)), conf, int(cls))
+                bbox[0], bbox[1], bbox[2], bbox[3], result.names.get(int(cls)), conf,
+                    id=track_ids[i] if track_ids is not None else -1)
             detections_msg.detections.append(detection_2d)
 
         return detections_msg, mask_img, detection_image

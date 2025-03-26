@@ -576,7 +576,7 @@ def launch_setup(context, *args, **kwargs):
                     'segmentation_image_topic': 'yolo/segmentation_image',
                     'segmentation_mask_image_topic': 'yolo/segmentation_mask_image',
                     'qos': 'SENSOR_DATA' if use_sensor_data_qos_str.lower() == "true" else 'SYSTEM_DEFAULT',
-                    'model_path': "yolo11m-seg.engine",
+                    'model_path': "yolo11x-seg.engine",  # rtdetr-l.pt, yolo11m-seg.engine
                     'export_model_format': '',
                     'use_image_dimensions': True,
                     'use_gpu': True,
@@ -607,7 +607,7 @@ def launch_setup(context, *args, **kwargs):
                     ("tracked_detections_2d", "tracked_detections_2d_" + str(i))
                 ]
         )
-        nodes_to_launch.append(tracking_node)
+        #nodes_to_launch.append(tracking_node)
 
     # multi stream detector
     multi_yolo_node = Node(
@@ -623,7 +623,7 @@ def launch_setup(context, *args, **kwargs):
                     'synchronization_interval': 0.1,
                     'input_image_topic_is_compressed': [False] * num_cameras_int,
                     'qos': 'SENSOR_DATA' if use_sensor_data_qos_str.lower() == "true" else 'SYSTEM_DEFAULT',
-                    'model_path': "yolo11m-seg.engine",
+                    'model_path': "yolo11m-seg.engine",  # rtdetr-l.pt, yolo11m-seg.engine
                     'export_model_format': '',
                     'use_gpu': True,
                     'show_image': False,
@@ -631,7 +631,7 @@ def launch_setup(context, *args, **kwargs):
             ],
             remappings=multi_stream_remappings
     )
-    nodes_to_launch.append(multi_yolo_node)
+    #nodes_to_launch.append(multi_yolo_node)
 
     # return the launch description
     camera_group = GroupAction(

@@ -6,6 +6,7 @@ Usage:
 """
 
 import time
+import uuid
 import struct
 import rclpy
 from rclpy.node import Node
@@ -27,6 +28,10 @@ from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point, Vector3, Pose, Quaternion
 from derived_object_msgs.msg import Object, ObjectArray
 from shape_msgs.msg import SolidPrimitive
+try:
+    from nav2_dynamic_msgs.msg import Obstacle, ObstacleArray
+except ImportError:
+    print("nav2_dynamic_msgs not found. ")
 import tf2_ros
 from tf2_ros import TransformBroadcaster, TransformListener, Buffer, LookupException, ConnectivityException, \
     ExtrapolationException
@@ -34,24 +39,95 @@ import tf_transformations
 import numpy as np
 import transforms3d
 from tf_transformations import quaternion_matrix, quaternion_from_matrix
+
 from cv_bridge import CvBridge
 import cv2
 import torch
 import torch.utils.dlpack
-from ultralytics import YOLO
+import ultralytics
 
 
-def pack_2d_detection(x, y, size_x, size_y, class_id, conf):
+def pack_2d_detection(x, y, size_x, size_y, class_id, conf, id):
     detection = Detection2D()
     detection.bbox.center.position.x = float(x)
     detection.bbox.center.position.y = float(y)
     detection.bbox.size_x = float(size_x)
     detection.bbox.size_y = float(size_y)
+    detection.id = str(id)
     hypothesis = ObjectHypothesisWithPose()
     hypothesis.hypothesis.class_id = class_id
     hypothesis.hypothesis.score = float(conf)
     detection.results.append(hypothesis)
     return detection
+
+
+def pack_nav2_obstacle_msg(x, y, size_x, size_y, class_id, conf, id=None):
+    if id in (None, -1):
+        uuid_ = uuid.uuid4()
+    else:
+        uuid_ = uuid.UUID(int=id)
+        # or
+        #id_str = str(id)
+        #uuid_ = uuid.uuid5(uuid.NAMESPACE_DNS, id_str)
+
+    obstacle_msg = Obstacle()
+    obstacle_msg.uuid.uuid = list(uuid_.bytes)
+    obstacle_msg.score = float(conf)
+    obstacle_msg.position.x = float(x)
+    obstacle_msg.position.y = float(y)
+    obstacle_msg.size.x = float(size_x)
+    obstacle_msg.size.y = float(size_y)
+    return obstacle_msg
+
+def pack_derived_object_msg(x, y, size_x, size_y, class_id, conf, id=None):
+    """Convert a nav2_dynamic_msgs/Obstacle into a derived_object_msgs/Object."""
+    obj = Object()
+    # Convert first 4 bytes of the obstacle's UUID into a uint32 id.
+    if id in (None, -1):
+        id = 10000000
+    obj.id = id
+
+    # Set detection level. Here we assume that an obstacle from tracking
+    # is equivalent to a TRACKED object.
+    obj.detection_level = Object.OBJECT_TRACKED
+
+    # Set pose. Use the obstacle's position and set a default orientation.
+    obj.pose.position = Point(x=float(x), y=float(y), z=0.0)
+    obj.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+
+    # Set twist using the obstacle's velocity; angular part is set to zero.
+    obj.twist.linear = Vector3(x=0.0, y=0.0, z=0.0)
+    obj.twist.angular = Vector3(x=0.0, y=0.0, z=0.0)
+
+    # Set acceleration to zero (no info available).
+    obj.accel.linear = Vector3(x=0.0, y=0.0, z=0.0)
+    obj.accel.angular = Vector3(x=0.0, y=0.0, z=0.0)
+
+    # Leave polygon empty.
+    # Convert obstacle size into a SolidPrimitive shape (assuming a box).
+    sp = SolidPrimitive()
+    sp.type = SolidPrimitive.BOX
+    sp.dimensions = [float(size_x), float(size_y), 0.0]
+    obj.shape = sp
+
+    # Set classification fields to defaults.
+    obj.classification = {
+        'car': Object.CLASSIFICATION_CAR,
+        'truck': Object.CLASSIFICATION_TRUCK,
+        'bus': Object.CLASSIFICATION_OTHER_VEHICLE,
+        'pedestrian': Object.CLASSIFICATION_PEDESTRIAN,
+        'cyclist': Object.CLASSIFICATION_MOTORCYCLE,
+        'bike': Object.CLASSIFICATION_BIKE
+    }.get(class_id, Object.CLASSIFICATION_UNKNOWN)
+
+    # Mark the object as classified if the detection score is high.
+    obj.object_classified = bool(conf > 0.25)  # same as conf_threshold
+    
+    # Convert the obstacle score (0-1) to a certainty value (0-255)
+    obj.classification_certainty = int(conf * 255)
+    obj.classification_age = 0
+
+    return obj
 
 
 class SingleStreamDetector(Node):
@@ -103,7 +179,7 @@ class SingleStreamDetector(Node):
                                                    'See https://docs.ultralytics.com/modes/export/#export-formats '
                                                    'for supported formats.',
                                type=ParameterType.PARAMETER_BOOL))
-        self.declare_parameter('track_2d', False)
+        self.declare_parameter('track_2d', True)
         self.declare_parameter('tracker_2d', 'bytetrack.yaml')
         self.declare_parameter('queue_size', 1)
         self.declare_parameter('use_gpu', True)
@@ -123,9 +199,9 @@ class SingleStreamDetector(Node):
         self.declare_parameter("resize_image", False)
         self.declare_parameter("half_precision", True)
         self.declare_parameter("conf_thresh", 0.25)
-        self.declare_parameter("iou_thresh", 0.5)
+        self.declare_parameter("iou_thresh", 0.7)
         self.declare_parameter("max_det", 300)
-        self.declare_parameter("classes", list(range(80)))
+        self.declare_parameter("classes", ['person', 'car'])  # [] or ['person', 'car'] or [0, 2]
         self.declare_parameter('static_camera_info', True)
 
         # Get parameters
@@ -153,7 +229,7 @@ class SingleStreamDetector(Node):
         self.conf_thresh = self.get_parameter("conf_thresh").get_parameter_value().double_value
         self.iou_thresh = self.get_parameter("iou_thresh").get_parameter_value().double_value
         self.max_det = self.get_parameter("max_det").get_parameter_value().integer_value
-        self.classes = self.get_parameter("classes").get_parameter_value().integer_array_value
+        self.classes = self.get_parameter("classes").value
         self.static_camera_info = self.get_parameter('static_camera_info').get_parameter_value().bool_value
 
         # Setup the device
@@ -171,11 +247,27 @@ class SingleStreamDetector(Node):
         self.imgsz = None
         self.bridge = CvBridge()
 
+        model_architectures = {
+            'yolo': ultralytics.YOLO,  # yolov8n-seg.pt, yolo11n-seg.pt, YOLO12n-seg.pt, yoloe-s.pt
+            'rtdetr': ultralytics.RTDETR,  # rtdetr-l.pt
+            'nas': ultralytics.NAS,  # yolo_nas_s.pt
+            'worldv2': ultralytics.YOLOWorld,  # yolov8s-worldv2.pt
+        }
+
+        if 'rtdetr' in self.model_path:
+            model_class = model_architectures['rtdetr']
+        elif 'nas' in self.model_path:
+            model_class = model_architectures['nas']
+        elif 'worldv2' in self.model_path:
+            model_class = model_architectures['worldv2']
+        else:
+            model_class = model_architectures['yolo']
+
         imgsz = self.image_dimensions if self.use_image_dimensions else (640, 640)
         # (optional) export the model
         if self.export_model_format:
             self.get_logger().info(f"Exporting model to {self.export_model_format} format...")
-            self.model = YOLO(self.model_path.split('.')[0] + '.pt')  # can only export pytorch models
+            self.model = model_class(self.model_path.split('.')[0] + '.pt')  # can only export pytorch models
             self.model.export(
                     format=self.export_model_format, half=self.half_precision, simplify=True, nms=True,
                     # imgsz=tuple(imgsz),  # not necessary if dynamic=True
@@ -189,12 +281,12 @@ class SingleStreamDetector(Node):
         # if model_path ends with .engine or .onnx, try loading the file and export if FileNotFoundError
         if self.model_path.split('.')[-1] in ['engine', 'onnx']:
             try:
-                self.model = YOLO(self.model_path)
+                self.model = model_class(self.model_path)
             except FileNotFoundError:
                 self.get_logger().info(f"Model not found: {self.model_path}. "
                                        f"Trying to export to {self.model_path.split('.')[-1]}.")
 
-                self.model = YOLO(self.model_path.split('.')[0] + '.pt')  # append .pt to the model path
+                self.model = model_class(self.model_path.split('.')[0] + '.pt')  # append .pt to the model path
                 self.model.export(
                         format=self.model_path.split('.')[-1],
                         half=self.half_precision,
@@ -207,7 +299,29 @@ class SingleStreamDetector(Node):
                 self.model_path = self.model_path.split('.')[0] + '.' + self.model_path.split('.')[-1]
 
         # Initialize model
-        self.model = YOLO(self.model_path)
+        self.model = model_class(self.model_path)
+
+        # Filter classes
+        class_names = self.model.names
+        class_names_inv = {v: k for k, v in class_names.items()}
+        supported_class_names = set(class_names_inv.keys())
+        if len(self.classes) == 0:
+            self.classes = list(range(80))
+        else:
+            if isinstance(self.classes, int):
+                assert self.classes < 80
+                self.classes = [self.classes]
+            elif isinstance(self.classes, str):
+                self.classes = [int(x.strip()) for x in self.classes.split(',')]  # assert all ints less than 80
+                assert all(x < 80 for x in self.classes)
+            elif isinstance(self.classes, list):
+                if isinstance(self.classes[0], str):
+                    assert all(x in supported_class_names for x in self.classes)
+                    self.classes = [class_names_inv[x.strip()] for x in self.classes]  # todo: assert that all are in class_names
+            else:
+                self.classes = list(self.classes)
+
+        self.get_logger().info(f"Only detecting classes: {[class_names[class_] for class_ in self.classes]}")
 
         self.use_segmentation = self.model_path.endswith("-seg.pt")
         self.results = None
@@ -270,6 +384,17 @@ class SingleStreamDetector(Node):
                 Detection2DArray,
                 self.detection_results_topic,
                 qos_profile)
+
+        self.object_array_pub = self.create_publisher(
+                ObjectArray,
+                'yolo/objects',
+                qos_profile
+        )
+
+        try:
+            self.obstacle_detection_pub = self.create_publisher(ObstacleArray, 'yolo/obstacles', qos_profile)
+        except NameError:
+            pass
 
         if self.publish_debug_image:
             self.detection_image_pub = self.create_publisher(
@@ -385,6 +510,8 @@ class SingleStreamDetector(Node):
 
         except Exception as e:
             self.get_logger().error(f'Error processing image: {e}')
+            # if self.debug:
+            #     raise e
 
 
     def camera_info_callback(self, msg):
@@ -474,8 +601,8 @@ class SingleStreamDetector(Node):
                         imgsz=self.imgsz,
                         device=self.device,
                         half=self.half_precision,
-                        # classes=self.classes,
-                        # max_det=self.max_det,
+                        classes=self.classes,
+                        max_det=self.max_det,
                         retina_masks=True,
                         show=False,
                         tracker=self.tracker_2d,
@@ -491,8 +618,8 @@ class SingleStreamDetector(Node):
                         imgsz=self.imgsz,
                         device=self.device,
                         half=self.half_precision,
-                        # classes=self.classes,
-                        # max_det=self.max_det,
+                        classes=self.classes,
+                        max_det=self.max_det,
                         retina_masks=True,
                         show=False,
                         stream=False
@@ -517,6 +644,18 @@ class SingleStreamDetector(Node):
         detections_msg.header.stamp = header.stamp  # self.get_clock().now().to_msg()
         detections_msg.header.frame_id = header.frame_id
 
+        objects_msg = ObjectArray()
+        objects_msg.header.stamp = header.stamp  # self.get_clock().now().to_msg()
+        objects_msg.header.frame_id = header.frame_id
+
+        try:
+            obstacle_msg = ObstacleArray()
+            obstacle_msg.header.stamp = header.stamp  # self.get_clock().now().to_msg()
+            obstacle_msg.header.frame_id = header.frame_id
+        except NameError as e:
+            self.get_logger().error(f'ObstacleArray message not found.')
+            obstacle_msg = None
+
         mask_img = None
 
         for result in results:
@@ -536,10 +675,11 @@ class SingleStreamDetector(Node):
             if bounding_box.shape[0] < 1:
                 return detections_msg, mask_img
 
+            track_ids = None
             if self.track_2d:
                 track_ids = result.boxes.id
                 if track_ids is not None:
-                    track_ids = track_ids.int().cpu().tolist()  # todo: add to message
+                    track_ids = track_ids.int().cpu().tolist()
 
             if hasattr(result, "masks") and masks is not None:
                 # mask_data = masks.data.cpu()  # masks drawn on the image [0-1] float. n x image_height x image_width
@@ -550,6 +690,10 @@ class SingleStreamDetector(Node):
                 if self.show_image:
                     cv2.imshow("masked_image", mask_img)
                     cv2.waitKey(1)
+                
+            else:
+                # create a list of Nones
+                masks = [None] * len(bounding_box)  # bounding_box.shape[0]
 
             if keypoints is not None:
                 keypoints = keypoints.cpu()  # Keypoints object for pose outputs
@@ -564,13 +708,33 @@ class SingleStreamDetector(Node):
                 # todo: speed up by avoiding this for-loop, e.g pass the bounding_boxes, masks and (depth/pointcloud) to the detection for loop
                 # preprocess
                 bbox = box.xywh.cpu().numpy().flatten()
-                mask_xy = mask.xy[0]
+                if mask is not None:
+                    # mask = mask.cpu().numpy()
+                    mask_xy = mask.xy[0]
                 track_id = box.id.int().cpu().item() if box.id is not None else -1
 
                 # pack 2D detection results
                 detection_2d = pack_2d_detection(
-                    bbox[0], bbox[1], bbox[2], bbox[3], result.names.get(int(cls)), conf)
+                    bbox[0], bbox[1], bbox[2], bbox[3], result.names.get(int(cls)), conf,
+                        id=track_ids[i] if track_ids is not None else -1)
                 detections_msg.detections.append(detection_2d)
+
+                # pack object message
+                object_2d = pack_derived_object_msg(bbox[0], bbox[1], bbox[2], bbox[3], result.names.get(int(cls)),
+                                                    conf,
+                                                    id=track_ids[i] if track_ids is not None else -1)
+                objects_msg.objects.append(object_2d)
+
+                if obstacle_msg is not None:
+                    obstacle_2d = pack_nav2_obstacle_msg(
+                        bbox[0], bbox[1], bbox[2], bbox[3], result.names.get(int(cls)), conf, id=track_ids[i] if track_ids is not None else -1)
+                    obstacle_msg.obstacles.append(obstacle_2d)
+
+
+            self.object_array_pub.publish(objects_msg)
+
+            if obstacle_msg is not None:
+                self.obstacle_detection_pub.publish(obstacle_msg)
 
             return detections_msg, mask_img
 
