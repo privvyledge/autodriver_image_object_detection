@@ -261,7 +261,7 @@ RUN mkdir -p ${BUILD_HOME}/src
 WORKDIR ${BUILD_HOME}
 
 RUN cd ${BUILD_HOME}/src && \
-    git clone https://github.com/privvyledge/autodriver_image_object_detection.git
+    git clone https://github.com/privvyledge/autodriver_image_object_detection.git -b batch_inference_and_tracking
 
 # Install gscam dependencies
 RUN sudo apt-get update -y && DEBIAN_FRONTEND="noninteractive" sudo apt-get install -y --no-install-recommends \
