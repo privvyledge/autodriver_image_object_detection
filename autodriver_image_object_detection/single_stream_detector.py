@@ -310,17 +310,18 @@ class SingleStreamDetector(Node):
 
         # Filter classes
         class_names = self.model.names
+        num_model_classes = len(class_names)
         class_names_inv = {v: k for k, v in class_names.items()}
         supported_class_names = set(class_names_inv.keys())
         if len(self.classes) == 0:
-            self.classes = list(range(80))
+            self.classes = list(range(num_model_classes))
         else:
             if isinstance(self.classes, int):
-                assert self.classes < 80
+                assert self.classes < num_model_classes
                 self.classes = [self.classes]
             elif isinstance(self.classes, str):
-                self.classes = [int(x.strip()) for x in self.classes.split(',')]  # assert all ints less than 80
-                assert all(x < 80 for x in self.classes)
+                self.classes = [int(x.strip()) for x in self.classes.split(',')]  # assert all ints less than num_model_classes
+                assert all(x < num_model_classes for x in self.classes)
             elif isinstance(self.classes, list):
                 if isinstance(self.classes[0], str):
                     assert all(x in supported_class_names for x in self.classes)
