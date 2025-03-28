@@ -519,11 +519,18 @@ def launch_setup(context, *args, **kwargs):
                 parameters=[
                     gscam_parameters,
                 ],
+                remappings=[
+                    ("camera/image_raw", f"image_raw"),
+                    ("camera/camera_info", f"camera_info"),
+                    ("camera/image_raw/compressed", "image_raw/compressed"),
+                    ("camera/image_raw/compressedDepth", "image_raw/compressedDepth"),
+                    ("camera/image_raw/theora", "camera/image_raw/theora"),
+                ]
         )
         nodes_to_launch.append(gscam_node)
 
         image_topic_is_compressed = False
-        image_topic = 'camera/image_raw'
+        image_topic = 'image_raw'
         if image_encoding_str == "jpeg":
             image_topic_is_compressed = True
             image_topic += '/compressed'
@@ -586,8 +593,8 @@ def launch_setup(context, *args, **kwargs):
         )
         nodes_to_launch.append(yolo_node)
 
-        multi_stream_remappings.append((f'stream_{i}/image_raw', f"{namespaces_list[i].strip().lstrip('/')}/camera/image_raw"))
-        multi_stream_remappings.append((f'stream_{i}/camera_info', f"{namespaces_list[i].strip().lstrip('/')}/camera/camera_info"))
+        multi_stream_remappings.append((f'stream_{i}/image_raw', f"{namespaces_list[i].strip().lstrip('/')}/image_raw"))
+        multi_stream_remappings.append((f'stream_{i}/camera_info', f"{namespaces_list[i].strip().lstrip('/')}/camera_info"))
 
         # add tracking node
         tracking_node = Node(
@@ -602,7 +609,7 @@ def launch_setup(context, *args, **kwargs):
                     }
                 ],
                 remappings=[
-                    ("image_raw", f"{namespaces_list[i].strip().lstrip('/')}/camera/image_raw"),
+                    ("image_raw", f"{namespaces_list[i].strip().lstrip('/')}/image_raw"),
                     ("detections_2d", f"stream_{i}/yolo/detection/results"),
                     ("tracked_detections_2d", "tracked_detections_2d_" + str(i))
                 ]
