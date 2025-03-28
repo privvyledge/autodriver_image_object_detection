@@ -159,10 +159,13 @@ def pack_derived_object_msg(x, y, size_x, size_y, class_id, conf, id=None):
         'car': Object.CLASSIFICATION_CAR,
         'truck': Object.CLASSIFICATION_TRUCK,
         'bus': Object.CLASSIFICATION_OTHER_VEHICLE,
-        'pedestrian': Object.CLASSIFICATION_PEDESTRIAN,
-        'cyclist': Object.CLASSIFICATION_MOTORCYCLE,
-        'bike': Object.CLASSIFICATION_BIKE
-    }.get(class_id, Object.CLASSIFICATION_UNKNOWN)
+        'person': Object.CLASSIFICATION_PEDESTRIAN,
+        'motorcycle': Object.CLASSIFICATION_MOTORCYCLE,
+        'bicycle': Object.CLASSIFICATION_BIKE,
+        'train': Object.CLASSIFICATION_OTHER_VEHICLE,
+        'airplane': Object.CLASSIFICATION_UNKNOWN_BIG,
+        'boat': Object.CLASSIFICATION_UNKNOWN_MEDIUM,
+    }.get(class_id, Object.CLASSIFICATION_UNKNOWN)  # Object.CLASSIFICATION_UNKNOWN_SMALL
 
     # Mark the object as classified if the detection score is high.
     obj.object_classified = bool(conf > 0.25)  # same as conf_threshold
