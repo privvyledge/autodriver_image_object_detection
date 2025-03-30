@@ -233,6 +233,9 @@ RUN sudo apt purge python3-sympy -y && python3.10 -m pip install "torch==2.5.1" 
 # Install tensorrt
 RUN python3.10 -m pip install tensorrt-cu12 tensorrt-lean-cu12 tensorrt-dispatch-cu12
 
+## Install Tensorflow with CUDA support and a version with CuDNN <= 9.1.0 since the base image has that installed
+#RUN python3.10 -m pip install "tensorflow[and-cuda]==2.17.0" keras
+
 # Install Ultralytics
 ARG ULTRALYTICS_VERSION
 RUN sudo apt-get update && \
@@ -261,7 +264,9 @@ RUN mkdir -p ${BUILD_HOME}/src
 WORKDIR ${BUILD_HOME}
 
 RUN cd ${BUILD_HOME}/src && \
-    git clone https://github.com/privvyledge/autodriver_image_object_detection.git -b batch_inference_and_tracking
+    git clone https://github.com/privvyledge/autodriver_image_object_detection.git -b batch_inference_and_tracking && \
+    git clone https://github.com/privvyledge/ros_images_to_files.git && \
+    git clone https://github.com/privvyledge/ros_multi_object_tracker.git
 
 # Install gscam dependencies
 RUN sudo apt-get update -y && DEBIAN_FRONTEND="noninteractive" sudo apt-get install -y --no-install-recommends \

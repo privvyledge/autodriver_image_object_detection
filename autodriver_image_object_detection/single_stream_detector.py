@@ -204,7 +204,7 @@ class SingleStreamDetector(Node):
         self.declare_parameter("resize_image", False)
         self.declare_parameter("half_precision", True)
         self.declare_parameter("conf_thresh", 0.25)
-        self.declare_parameter("iou_thresh", 0.7)
+        self.declare_parameter("iou_thresh", 0.45)
         self.declare_parameter("max_det", 300)
         self.declare_parameter("classes", ['person', 'car'])  # [] or ['person', 'car'] or [0, 2]
         self.declare_parameter('static_camera_info', True)
@@ -252,6 +252,8 @@ class SingleStreamDetector(Node):
         self.image_height = None
         self.imgsz = None
         self.bridge = CvBridge()
+        self.use_segmentation = "seg" in self.model_path
+        self.task = "segment" if self.use_segmentation else "detect"
 
         if self.plot_tracks:
             # Store the track history
@@ -277,7 +279,10 @@ class SingleStreamDetector(Node):
         # (optional) export the model
         if self.export_model_format:
             self.get_logger().info(f"Exporting model to {self.export_model_format} format...")
-            self.model = model_class(self.model_path.split('.')[0] + '.pt')  # can only export pytorch models
+            self.model = model_class(
+                    self.model_path.split('.')[0] + '.pt',
+                    # task=self.task,
+            )  # can only export pytorch models
             self.model.export(
                     format=self.export_model_format, half=self.half_precision, simplify=True, nms=True,
                     # imgsz=tuple(imgsz),  # not necessary if dynamic=True
@@ -291,12 +296,18 @@ class SingleStreamDetector(Node):
         # if model_path ends with .engine or .onnx, try loading the file and export if FileNotFoundError
         if self.model_path.split('.')[-1] in ['engine', 'onnx']:
             try:
-                self.model = model_class(self.model_path)
+                self.model = model_class(
+                        self.model_path,
+                        # task=self.task,
+                )
             except FileNotFoundError:
                 self.get_logger().info(f"Model not found: {self.model_path}. "
                                        f"Trying to export to {self.model_path.split('.')[-1]}.")
 
-                self.model = model_class(self.model_path.split('.')[0] + '.pt')  # append .pt to the model path
+                self.model = model_class(
+                        self.model_path.split('.')[0] + '.pt',
+                        # task=self.task,
+                )  # append .pt to the model path
                 self.model.export(
                         format=self.model_path.split('.')[-1],
                         half=self.half_precision,
@@ -309,7 +320,10 @@ class SingleStreamDetector(Node):
                 self.model_path = self.model_path.split('.')[0] + '.' + self.model_path.split('.')[-1]
 
         # Initialize model
-        self.model = model_class(self.model_path)
+        self.model = model_class(
+                self.model_path,
+                # task=self.task,
+        )
 
         # Filter classes
         class_names = self.model.names
@@ -328,13 +342,12 @@ class SingleStreamDetector(Node):
             elif isinstance(self.classes, list):
                 if isinstance(self.classes[0], str):
                     assert all(x in supported_class_names for x in self.classes)
-                    self.classes = [class_names_inv[x.strip()] for x in self.classes]  # todo: assert that all are in class_names
+                    self.classes = [class_names_inv[x.strip()] for x in self.classes]
             else:
                 self.classes = list(self.classes)
 
         self.get_logger().info(f"Only detecting classes: {[class_names[class_] for class_ in self.classes]}")
 
-        self.use_segmentation = self.model_path.endswith("-seg.pt")
         self.results = None
         self.detection_image = None
         self.camera_info = None
