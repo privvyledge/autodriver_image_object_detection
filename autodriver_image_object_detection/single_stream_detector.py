@@ -6,10 +6,14 @@ Usage:
 
 Todo:
      1. Add verbose=False parameter to predict function [done]
-     2. Setup parameter change callback
-     3. Add support for masking an image with an ROI, running inference then displaying the full image detection results
+     2. Setup parameter change callback [done]
+     3. Add support for masking an image with an ROI, running inference then displaying the full image detection results. See:
+        * https://github.com/ultralytics/ultralytics/blob/main/examples/YOLOv8-Region-Counter/yolov8_region_counter.py
+        * https://github.com/ultralytics/ultralytics/blob/main/ultralytics/solutions/trackzone.py
+        * https://docs.ultralytics.com/guides/region-counting/#real-world-applications
      4. Add support for disabling plotting of masks, labels, boxes, probs, etc in show/publish_debug_image namespace
-     5. Add support for snapshot mode. I.e triggers a service if num_detections > 0 for rosbag/video recording e.g recording motion only
+     5. Add add_class and remove_class parameters/services
+     6. Add support for snapshot mode. I.e triggers a service if num_detections > 0 for rosbag/video recording e.g recording motion only
 """
 import os
 import time
@@ -251,8 +255,7 @@ class SingleStreamDetector(Node):
         self.verbose = self.get_parameter("verbose").get_parameter_value().bool_value
         self.static_camera_info = self.get_parameter('static_camera_info').get_parameter_value().bool_value
 
-        if not self.verbose:
-            os.environ['YOLO_VERBOSE'] = 'False'
+        os.environ['YOLO_VERBOSE'] = str(self.verbose)
 
         # Setup the device
         self.device = 'cpu'
@@ -862,6 +865,8 @@ class SingleStreamDetector(Node):
                                                "GPU backend cannot use torch functions.")
             elif param.name == 'show_image' and param.type_ == Parameter.Type.BOOL:
                 self.show_image = param.value
+                if not self.show_image:
+                    cv2.destroyAllWindows()
             elif param.name == 'use_image_dimensions' and param.type_ == Parameter.Type.BOOL:
                 self.use_image_dimensions = param.value
             elif param.name == 'image_dimensions' and param.type_ == Parameter.Type.INTEGER_ARRAY:
@@ -884,6 +889,7 @@ class SingleStreamDetector(Node):
                 self.augment = param.value
             elif param.name == 'verbose' and param.type_ == Parameter.Type.BOOL:
                 self.verbose = param.value
+                os.environ['YOLO_VERBOSE'] = str(self.verbose)
             elif param.name == 'static_camera_info' and param.type_ == Parameter.Type.BOOL:
                 self.static_camera_info = param.value
             else:
