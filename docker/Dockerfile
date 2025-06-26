@@ -140,12 +140,12 @@ RUN apt update && DEBIAN_FRONTEND="noninteractive" apt-get install -y --no-insta
     apt purge python-rosdep2 python3-rosdep2 -y && \
     apt update && DEBIAN_FRONTEND="noninteractive" apt install -y \
     python3-rosdep \
-    ros-humble-desktop \
-    ros-humble-perception \
+    ros-${ROS_DISTRO}-desktop \
+    ros-${ROS_DISTRO}-perception \
     ros-dev-tools \
-    ros-humble-rmw-cyclonedds-cpp && \
+    ros-${ROS_DISTRO}-rmw-cyclonedds-cpp && \
     rm -rf /var/lib/apt/lists/* && \
-    . /opt/ros/humble/setup.bash && \
+    . /opt/ros/${ROS_DISTRO}/setup.bash && \
     sudo rosdep init && \
     rosdep update && \
     rm -rf /var/lib/apt/lists/*
@@ -248,7 +248,7 @@ RUN sudo apt-get update && \
     cd ${HOME} && git clone https://github.com/ultralytics/ultralytics -b ${ULTRALYTICS_VERSION} && \
     cd ultralytics && \
     python3.10 -m pip install --upgrade pip wheel "setuptools==70.0.0" && \
-    cd ${HOME}/ultralytics/ && python3.10 -m pip install -e ".[export]" "lap>=0.5.12" dill && \
+    cd ${HOME}/ultralytics/ && python3.10 -m pip install -e ".[export]" "lap>=0.5.12" dill onnxslim && \
     python3.10 -m pip install "numpy==1.26.4" && \
     sudo rm -rf /var/lib/apt/lists/*
 

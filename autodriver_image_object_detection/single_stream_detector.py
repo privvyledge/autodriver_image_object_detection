@@ -3,8 +3,15 @@ Single stream detector for object detection with optional tracking.
 Usage:
     sudo apt-get install ros-${ROS_DISTRO}-vision-msgs
     ros2 run autodriver_image_object_detection single_stream_detector
-"""
 
+Todo:
+     1. Add verbose=False parameter to predict function [done]
+     2. Setup parameter change callback
+     3. Add support for masking an image with an ROI, running inference then displaying the full image detection results
+     4. Add support for disabling plotting of masks, labels, boxes, probs, etc in show/publish_debug_image namespace
+     5. Add support for snapshot mode. I.e triggers a service if num_detections > 0 for rosbag/video recording e.g recording motion only
+"""
+import os
 import time
 import uuid
 import struct
@@ -15,7 +22,7 @@ from rclpy.parameter import Parameter
 from rclpy import qos
 from rclpy.time import Time
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-from rcl_interfaces.msg import ParameterDescriptor, ParameterType
+from rcl_interfaces.msg import ParameterDescriptor, ParameterType, SetParametersResult
 from std_msgs.msg import Header, ColorRGBA
 from sensor_msgs.msg import Image, CompressedImage, CameraInfo, Imu, PointCloud2, PointField
 from vision_msgs.msg import Detection2D, Detection2DArray, Detection3D, Detection3DArray, ObjectHypothesisWithPose
@@ -206,7 +213,10 @@ class SingleStreamDetector(Node):
         self.declare_parameter("conf_thresh", 0.25)
         self.declare_parameter("iou_thresh", 0.45)
         self.declare_parameter("max_det", 300)
-        self.declare_parameter("classes", ['person', 'car'])  # [] or ['person', 'car'] or [0, 2]
+        self.declare_parameter("classes", ['person', 'car', 'bicycle', 'motorcycle', 'bus', 'truck'])  # [] or ['person', 'car'] or [0, 2]
+        self.declare_parameter("agnostic_nms", False)
+        self.declare_parameter("augment", False)
+        self.declare_parameter("verbose", False)
         self.declare_parameter('static_camera_info', True)
 
         # Get parameters
@@ -236,7 +246,13 @@ class SingleStreamDetector(Node):
         self.iou_thresh = self.get_parameter("iou_thresh").get_parameter_value().double_value
         self.max_det = self.get_parameter("max_det").get_parameter_value().integer_value
         self.classes = self.get_parameter("classes").value
+        self.agnostic_nms = self.get_parameter("agnostic_nms").get_parameter_value().bool_value
+        self.augment = self.get_parameter("augment").get_parameter_value().bool_value
+        self.verbose = self.get_parameter("verbose").get_parameter_value().bool_value
         self.static_camera_info = self.get_parameter('static_camera_info').get_parameter_value().bool_value
+
+        if not self.verbose:
+            os.environ['YOLO_VERBOSE'] = 'False'
 
         # Setup the device
         self.device = 'cpu'
@@ -284,7 +300,7 @@ class SingleStreamDetector(Node):
                     # task=self.task,
             )  # can only export pytorch models
             self.model.export(
-                    format=self.export_model_format, half=self.half_precision, simplify=True, nms=True,
+                    format=self.export_model_format, half=self.half_precision, simplify=True, nms=self.iou_thresh > 0.0,
                     # imgsz=tuple(imgsz),  # not necessary if dynamic=True
                     dynamic=True,
                     device=self.device
@@ -312,7 +328,7 @@ class SingleStreamDetector(Node):
                         format=self.model_path.split('.')[-1],
                         half=self.half_precision,
                         simplify=True,
-                        nms=True,
+                        nms=self.iou_thresh > 0.0,
                         # imgsz=tuple(imgsz),  # not necessary if dynamic=True
                         dynamic=True,
                         device=self.device
@@ -390,6 +406,11 @@ class SingleStreamDetector(Node):
         if self.input_image_topic_is_compressed or "compressed" in self.input_image_topic:
             self.image_message_format = "compressed"
             self.image_message_type = CompressedImage
+
+        # Setup dynamic parameter reconfiguring.
+        # Register a callback function that will be called whenever there is an attempt to
+        # change one or more parameters of the node.
+        self.add_on_set_parameters_callback(self.parameter_change_callback)
 
         # Subscribers
         self.image_sub = self.create_subscription(
@@ -600,7 +621,7 @@ class SingleStreamDetector(Node):
             #conversion = cv2.COLOR_GRAY2BGR
             #inverse_conversion = cv2.COLOR_BGR2GRAY
         else:
-            self.get_logger().error("Unsupported encoding:", msg_encoding)
+            self.get_logger().error(f"Unsupported encoding: {msg_encoding}")
             self.exit(1)
 
         # convert ROS2 image message to OpenCV
@@ -616,6 +637,7 @@ class SingleStreamDetector(Node):
 
     def detect_objects(self, image):
         try:
+            # todo: use a dictionary then pass keyword arguments to .predict and .track
             if self.track_2d:
                 # https://docs.ultralytics.com/modes/track/#why-choose-ultralytics-yolo-for-object-tracking
                 self.results = self.model.track(
@@ -629,9 +651,12 @@ class SingleStreamDetector(Node):
                         max_det=self.max_det,
                         retina_masks=True,
                         show=False,
+                        stream=False,
+                        augment=self.augment,
+                        agnostic_nms=self.agnostic_nms,  # todo: test True
+                        verbose=self.verbose,
                         tracker=self.tracker_2d,
-                        persist=True,
-                        stream=False
+                        persist=True
                 )
             else:
                 # https://docs.ultralytics.com/modes/predict/#inference-arguments
@@ -646,7 +671,10 @@ class SingleStreamDetector(Node):
                         max_det=self.max_det,
                         retina_masks=True,
                         show=False,
-                        stream=False
+                        stream=False,
+                        augment=self.augment,
+                        agnostic_nms=self.agnostic_nms,  # todo: test True
+                        verbose=self.verbose,
                 )
 
                 # # or control each step (predict/track does all three steps)
@@ -662,6 +690,7 @@ class SingleStreamDetector(Node):
             detections_msg, mask_img = self.create_detections_array(results, header)
 
             return detections_msg, self.detection_image, mask_img
+        return None
 
     def create_detections_array(self, results, header):
         detections_msg = Detection2DArray()
@@ -683,7 +712,16 @@ class SingleStreamDetector(Node):
         mask_img = None
 
         for result in results:
-            self.detection_image = result.plot()
+            self.detection_image = result.plot(
+                    conf=True,
+                    labels=True,
+                    boxes=True,
+                    masks=True,
+                    probs=True,
+                    # # todo: use the image below to specify the original image if passing an ROI masked image to the detector
+                    # img=None,  # numpy image to overlay detections on. This is slower since it needs to be tranferred to GPU
+                    # im_gpu=None,  # torch tensor image to overlay detections on. This is faster since it does not need to be tranferred to GPU
+            )
             if self.show_image:
                 # Visualize the results on the frame
                 cv2.imshow("image", self.detection_image)
@@ -773,6 +811,85 @@ class SingleStreamDetector(Node):
                 self.obstacle_detection_pub.publish(obstacle_msg)
 
             return detections_msg, mask_img
+        return None
+
+    def parameter_change_callback(self, params):
+        """
+        Todo:
+            * change topics (input/output) and destroy subscribers/publishers
+        Triggered whenever there is a change request for one or more parameters.
+
+        Args:
+            params (List[Parameter]): A list of Parameter objects representing the parameters that are
+                being attempted to change.
+
+        Returns:
+            SetParametersResult: Object indicating whether the change was successful.
+        """
+        result = SetParametersResult()
+        result.successful = True
+
+        # Iterate over each parameter in this node
+        for param in params:
+            if param.name == 'publish_debug_image' and param.type_ == Parameter.Type.BOOL:
+                self.publish_debug_image = param.value
+            elif param.name == 'model_path' and param.type_ == Parameter.Type.STRING:
+                self.model_path = param.value
+                # todo: load the model
+            elif param.name == 'track_2d' and param.type_ == Parameter.Type.BOOL:
+                self.track_2d = param.value
+            elif param.name == 'tracker_2d' and param.type_ == Parameter.Type.STRING:
+                self.tracker_2d = param.value
+            elif param.name == 'plot_tracks' and param.type_ == Parameter.Type.BOOL:
+                self.plot_tracks = param.value
+            elif param.name == 'use_gpu' and param.type_ == Parameter.Type.BOOL:
+                self.use_gpu = False
+
+                # Then check GPU availability if use_gpu
+                use_gpu = param.value
+                if use_gpu:
+                    if torch.cuda.is_available():
+                        self.device = 'cuda:0'
+                        self.torch_device = torch.device('cuda:0')
+                        self.use_gpu = True
+                    else:
+                        self.device = 'cpu'
+                        self.torch_device = torch.device('cpu')
+                        self.use_gpu = False
+                        result.successful = False
+                        result.reason = "Torch was not installed/built with CUDA support. GPU backend cannot use torch functions."
+                        self.get_logger().warn("Torch was not installed/built with CUDA support. "
+                                               "GPU backend cannot use torch functions.")
+            elif param.name == 'show_image' and param.type_ == Parameter.Type.BOOL:
+                self.show_image = param.value
+            elif param.name == 'use_image_dimensions' and param.type_ == Parameter.Type.BOOL:
+                self.use_image_dimensions = param.value
+            elif param.name == 'image_dimensions' and param.type_ == Parameter.Type.INTEGER_ARRAY:
+                self.image_dimensions = param.value
+            elif param.name == 'resize_image' and param.type_ == Parameter.Type.BOOL:
+                self.resize_image = param.value
+            elif param.name == 'half_precision' and param.type_ == Parameter.Type.BOOL:
+                self.half_precision = param.value
+            elif param.name == 'conf_thresh' and param.type_ == Parameter.Type.DOUBLE:
+                self.conf_thresh = param.value
+            elif param.name == 'iou_thresh' and param.type_ == Parameter.Type.DOUBLE:
+                self.iou_thresh = param.value
+            elif param.name == 'max_det' and param.type_ == Parameter.Type.INTEGER:
+                self.max_det = param.value
+            elif param.name == 'classes' and param.type_ in (Parameter.Type.STRING_ARRAY, Parameter.Type.INTEGER_ARRAY):
+                self.classes = param.value  # todo:
+            elif param.name == 'agnostic_nms' and param.type_ == Parameter.Type.BOOL:
+                self.agnostic_nms = param.value
+            elif param.name == 'augment' and param.type_ == Parameter.Type.BOOL:
+                self.augment = param.value
+            elif param.name == 'verbose' and param.type_ == Parameter.Type.BOOL:
+                self.verbose = param.value
+            elif param.name == 'static_camera_info' and param.type_ == Parameter.Type.BOOL:
+                self.static_camera_info = param.value
+            else:
+                result.successful = False
+            self.get_logger().info(f"Success = {result.successful} for param {param.name} to value {param.value}")
+        return result
 
 
 def main(args=None):

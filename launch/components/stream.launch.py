@@ -42,9 +42,15 @@ Todo:
     * test using appsink [done]
     * test new list string parsing [done]
     * visualize the image using RQT or RViz [done]
-    * add support for file saving (use my package instead)
-    * add support for mjpg (H264) encoding and print auto checking result
-    * setup file, camera camera and rtsp streaming
+    * add support for file saving (use my package instead) [done]
+    * add support for mjpg (H264) encoding and print auto checking result [done]
+    * setup file, camera camera and rtsp streaming [done]
+    * add support for saving raw image, yolo detection or both
+    * add support for disabling detection, gscam or both
+    * add support for model name as an argument
+    * add support for automatic stream type inferencing e.g file, rtsp, camera from "stream_sources"
+    * add support for ros_deep_learning and jetson_inference for Jetsons (and maybe x86) since gscam doesn't support nvidia Jetsons gstreamer pipelines
+    * move detection to a separate launch file and keep this streaming only
     * cleanup the autoconfig string addition
     * add composition
 """
@@ -168,6 +174,7 @@ def launch_setup(context, *args, **kwargs):
     gscam_config = LaunchConfiguration('gscam_config', default='[""]')
     save_videos = LaunchConfiguration('save_videos', default="False")
     video_save_filenames = LaunchConfiguration('video_save_filenames', default='["video0.mp4"]')
+    video_save_source = LaunchConfiguration('video_save_source', default='raw')
     loop = LaunchConfiguration('loop', default="True")
     sync_sink = LaunchConfiguration('sync_sink', default="True")
     use_gst_timestamps = LaunchConfiguration('use_gst_timestamps', default="True")
@@ -300,6 +307,12 @@ def launch_setup(context, *args, **kwargs):
                         'Used only if save_videos is true. Recommended: .mp4, .avi, .mpeg'
     )
 
+    declare_video_save_source_cmd = DeclareLaunchArgument(
+            'video_save_source',
+            default_value=video_save_source,
+            description='The image topic to use when saving videos. Options: raw, detection, both'
+    )
+
     declare_loop_cmd = DeclareLaunchArgument(
             'loop',
             default_value=loop,
@@ -362,6 +375,7 @@ def launch_setup(context, *args, **kwargs):
         declare_gscam_config_cmd,
         declare_save_videos_cmd,
         declare_video_save_filenames_cmd,
+        declare_video_save_source_cmd,
         declare_loop_cmd,
         declare_sync_sink_cmd,
         declare_use_gst_timestamps_cmd,
@@ -525,7 +539,9 @@ def launch_setup(context, *args, **kwargs):
                     ("camera/image_raw/compressed", "image_raw/compressed"),
                     ("camera/image_raw/compressedDepth", "image_raw/compressedDepth"),
                     ("camera/image_raw/theora", "camera/image_raw/theora"),
-                ]
+                ],
+                respawn=True,
+                respawn_delay=2.0,
         )
         nodes_to_launch.append(gscam_node)
 
@@ -537,7 +553,7 @@ def launch_setup(context, *args, **kwargs):
 
         # Launch video recording via my ros_images_to_files package since gscam does not support output sinks
         if save_videos_str.lower() == "true":
-            video_record_topic = image_topic
+            video_record_topic = image_topic if video_save_source == "raw" else 'yolo/detection_image'
             output_file_name = video_save_filenames_list[i]
             try:
                 # search for the package and catch the exception if it does not exist

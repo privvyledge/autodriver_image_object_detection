@@ -3,8 +3,9 @@ ROS2 node for obstacle detection using Euclidean Clustering on Point Clouds.
 Publishes clustered pointcloud, visualization markers, and object array.
 
 Usage:
-    sudo apt-get install ros-${ROS_DISTRO}-derived-object-msgs ros-${ROS_DISTRO}-vision-msgs
-    ros2 run autodriver_image_object_detection yolo_detection_node
+    * sudo apt-get install ros-${ROS_DISTRO}-derived-object-msgs ros-${ROS_DISTRO}-vision-msgs
+    * (optional) export LD_PRELOAD=${HOME}/sdks/open3d_install/lib/libOpen3D.so # to fix open3d python ImportError
+    * ros2 run autodriver_image_object_detection yolo_detection_node
 
 1. Subscribe to image, pointcloud, depth using message filters
 2. Detect obstacles using YOLO [done]
@@ -351,13 +352,13 @@ class ImageObstacleDetectionNode(Node):
         # Setup the device
         self.device = 'cpu'
         self.torch_device = torch.device('cpu')
-        if self.project_to_3d and self.use_pointcloud:
+        if self.project_to_3d:
             self.o3d_device = o3d.core.Device('CPU:0')
         if self.use_gpu:
             if torch.cuda.is_available():
                 self.device = 'cuda:0'
                 self.torch_device = torch.device('cuda:0')
-                if self.project_to_3d and self.use_pointcloud:
+                if self.project_to_3d:
                     if o3d.core.cuda.is_available():
                         self.o3d_device = o3d.core.Device('CUDA:0')
 
