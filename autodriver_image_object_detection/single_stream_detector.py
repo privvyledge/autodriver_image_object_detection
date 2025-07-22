@@ -73,7 +73,7 @@ def pack_2d_detection(x, y, size_x, size_y, class_id, conf, id):
     return detection
 
 
-def pack_nav2_obstacle_msg(x, y, size_x, size_y, class_id, conf, id=None):
+def pack_nav2_obstacle_msg(x, y, size_x, size_y, class_id, conf, id=None, z_size=1.0):
     if id in (None, -1):
         uuid_ = uuid.uuid4()
     else:
@@ -89,9 +89,10 @@ def pack_nav2_obstacle_msg(x, y, size_x, size_y, class_id, conf, id=None):
     obstacle_msg.position.y = float(y)
     obstacle_msg.size.x = float(size_x)
     obstacle_msg.size.y = float(size_y)
+    obstacle_msg.size.z = float(z_size)  # 0.0
     return obstacle_msg
 
-def pack_derived_object_msg(x, y, size_x, size_y, class_id, conf, id=None):
+def pack_derived_object_msg(x, y, size_x, size_y, class_id, conf, id=None, z_size=1.0):
     """Convert a nav2_dynamic_msgs/Obstacle into a derived_object_msgs/Object."""
     obj = Object()
     # Convert first 4 bytes of the obstacle's UUID into a uint32 id.
@@ -119,7 +120,7 @@ def pack_derived_object_msg(x, y, size_x, size_y, class_id, conf, id=None):
     # Convert obstacle size into a SolidPrimitive shape (assuming a box).
     sp = SolidPrimitive()
     sp.type = SolidPrimitive.BOX
-    sp.dimensions = [float(size_x), float(size_y), 0.0]
+    sp.dimensions = [float(size_x), float(size_y), z_size]
     obj.shape = sp
 
     # Set classification fields to defaults.
@@ -218,6 +219,7 @@ class SingleStreamDetector(Node):
         self.declare_parameter("iou_thresh", 0.45)
         self.declare_parameter("max_det", 300)
         self.declare_parameter("classes", ['person', 'car', 'bicycle', 'motorcycle', 'bus', 'truck'])  # [] or ['person', 'car'] or [0, 2]
+        self.declare_parameter("update_class", "")  # type "class_name" to add or "-class_name" to delete
         self.declare_parameter("agnostic_nms", False)
         self.declare_parameter("augment", False)
         self.declare_parameter("verbose", False)
@@ -250,6 +252,7 @@ class SingleStreamDetector(Node):
         self.iou_thresh = self.get_parameter("iou_thresh").get_parameter_value().double_value
         self.max_det = self.get_parameter("max_det").get_parameter_value().integer_value
         self.classes = self.get_parameter("classes").value
+        self.update_class = self.get_parameter("update_class").value
         self.agnostic_nms = self.get_parameter("agnostic_nms").get_parameter_value().bool_value
         self.augment = self.get_parameter("augment").get_parameter_value().bool_value
         self.verbose = self.get_parameter("verbose").get_parameter_value().bool_value
@@ -262,8 +265,10 @@ class SingleStreamDetector(Node):
         self.torch_device = torch.device('cpu')
         if self.use_gpu:
             if torch.cuda.is_available():
-                self.device = 'cuda:0'
+                self.device = 'cuda:0'  # 'cuda'
                 self.torch_device = torch.device('cuda:0')
+        else:
+            self.use_gpu = False
 
         # Initialize variables
         self.image_frame_id = None
@@ -342,13 +347,14 @@ class SingleStreamDetector(Node):
         self.model = model_class(
                 self.model_path,
                 # task=self.task,
-        )
+        ).to(self.torch_device)
 
         # Filter classes
-        class_names = self.model.names
-        num_model_classes = len(class_names)
-        class_names_inv = {v: k for k, v in class_names.items()}
-        supported_class_names = set(class_names_inv.keys())
+        self.class_names: dict[int, str] = self.model.names
+        num_model_classes = len(self.class_names)
+        self.class_names_inv = {v: k for k, v in self.class_names.items()}
+        self.supported_class_names = set(self.class_names_inv.keys())
+        self.supported_class_keys = set(self.class_names.keys())
         if len(self.classes) == 0:
             self.classes = list(range(num_model_classes))
         else:
@@ -359,13 +365,21 @@ class SingleStreamDetector(Node):
                 self.classes = [int(x.strip()) for x in self.classes.split(',')]  # assert all ints less than num_model_classes
                 assert all(x < num_model_classes for x in self.classes)
             elif isinstance(self.classes, list):
+                # remove empty strings from the list but keep 0
+                self.classes = [desired_class for desired_class in self.classes if desired_class or desired_class == 0]
+                # if classes is a list of strings
                 if isinstance(self.classes[0], str):
-                    assert all(x in supported_class_names for x in self.classes)
-                    self.classes = [class_names_inv[x.strip()] for x in self.classes]
+                    assert all(x in self.supported_class_names for x in self.classes)
+                    self.classes = [self.class_names_inv[x.strip()] for x in self.classes]
+                # if classes is a list of ints
+                elif isinstance(self.classes[0], int):
+                    assert all(x in self.supported_class_keys for x in self.classes)
+                else:
+                    raise ValueError("Classes must either be a list of ints or a strings.")
             else:
                 self.classes = list(self.classes)
 
-        self.get_logger().info(f"Only detecting classes: {[class_names[class_] for class_ in self.classes]}")
+        self.get_logger().info(f"Only detecting classes: {[self.class_names[class_] for class_ in self.classes]}")
 
         self.results = None
         self.detection_image = None
@@ -409,6 +423,24 @@ class SingleStreamDetector(Node):
         if self.input_image_topic_is_compressed or "compressed" in self.input_image_topic:
             self.image_message_format = "compressed"
             self.image_message_type = CompressedImage
+
+        # Setup inference dictionary
+        self.inference_dict = {
+            'source': None,
+            'conf': self.conf_thresh,
+            'iou': self.iou_thresh,
+            'imgsz': self.imgsz,
+            'device': self.device,
+            'half': self.half_precision,
+            'classes': self.classes,
+            'max_det': self.max_det,
+            'retina_masks': True,
+            'show': False,
+            'stream': False,
+            'augment': self.augment,
+            'agnostic_nms': self.agnostic_nms,
+            'verbose': self.verbose
+        }
 
         # Setup dynamic parameter reconfiguring.
         # Register a callback function that will be called whenever there is an attempt to
@@ -491,6 +523,7 @@ class SingleStreamDetector(Node):
                 else:
                     self.imgsz = (640, 640)
 
+            self.inference_dict['imgsz'] = self.imgsz
             # (optional) resize the image
             if self.resize_image and self.use_image_dimensions and (
                     (self.image_height, self.image_width) != (self.imgsz[0], self.imgsz[1])):
@@ -640,45 +673,17 @@ class SingleStreamDetector(Node):
 
     def detect_objects(self, image):
         try:
-            # todo: use a dictionary then pass keyword arguments to .predict and .track
+            self.inference_dict['source'] = image
             if self.track_2d:
                 # https://docs.ultralytics.com/modes/track/#why-choose-ultralytics-yolo-for-object-tracking
                 self.results = self.model.track(
-                        source=image,
-                        conf=self.conf_thresh,
-                        iou=self.iou_thresh,
-                        imgsz=self.imgsz,
-                        device=self.device,
-                        half=self.half_precision,
-                        classes=self.classes,
-                        max_det=self.max_det,
-                        retina_masks=True,
-                        show=False,
-                        stream=False,
-                        augment=self.augment,
-                        agnostic_nms=self.agnostic_nms,  # todo: test True
-                        verbose=self.verbose,
                         tracker=self.tracker_2d,
-                        persist=True
+                        persist=True,
+                        **self.inference_dict
                 )
             else:
                 # https://docs.ultralytics.com/modes/predict/#inference-arguments
-                self.results = self.model.predict(
-                        source=image,
-                        conf=self.conf_thresh,
-                        iou=self.iou_thresh,
-                        imgsz=self.imgsz,
-                        device=self.device,
-                        half=self.half_precision,
-                        classes=self.classes,
-                        max_det=self.max_det,
-                        retina_masks=True,
-                        show=False,
-                        stream=False,
-                        augment=self.augment,
-                        agnostic_nms=self.agnostic_nms,  # todo: test True
-                        verbose=self.verbose,
-                )
+                self.results = self.model.predict(**self.inference_dict)
 
                 # # or control each step (predict/track does all three steps)
                 # im = model.predictor.preprocess(source)[0]
@@ -850,19 +855,20 @@ class SingleStreamDetector(Node):
 
                 # Then check GPU availability if use_gpu
                 use_gpu = param.value
+                self.device = 'cpu'
+                self.torch_device = torch.device('cpu')
                 if use_gpu:
                     if torch.cuda.is_available():
                         self.device = 'cuda:0'
                         self.torch_device = torch.device('cuda:0')
                         self.use_gpu = True
                     else:
-                        self.device = 'cpu'
-                        self.torch_device = torch.device('cpu')
                         self.use_gpu = False
                         result.successful = False
                         result.reason = "Torch was not installed/built with CUDA support. GPU backend cannot use torch functions."
                         self.get_logger().warn("Torch was not installed/built with CUDA support. "
                                                "GPU backend cannot use torch functions.")
+                self.inference_dict['device'] = self.device
             elif param.name == 'show_image' and param.type_ == Parameter.Type.BOOL:
                 self.show_image = param.value
                 if not self.show_image:
@@ -875,21 +881,57 @@ class SingleStreamDetector(Node):
                 self.resize_image = param.value
             elif param.name == 'half_precision' and param.type_ == Parameter.Type.BOOL:
                 self.half_precision = param.value
+                self.inference_dict['half'] = self.half_precision
             elif param.name == 'conf_thresh' and param.type_ == Parameter.Type.DOUBLE:
                 self.conf_thresh = param.value
+                self.inference_dict['conf'] = self.conf_thresh
             elif param.name == 'iou_thresh' and param.type_ == Parameter.Type.DOUBLE:
                 self.iou_thresh = param.value
+                self.inference_dict['iou'] = self.iou_thresh
             elif param.name == 'max_det' and param.type_ == Parameter.Type.INTEGER:
                 self.max_det = param.value
+                self.inference_dict['max_det'] = self.max_det
             elif param.name == 'classes' and param.type_ in (Parameter.Type.STRING_ARRAY, Parameter.Type.INTEGER_ARRAY):
-                self.classes = param.value  # todo:
+                classes = param.value
+                if param.type_ == Parameter.Type.STRING_ARRAY:
+                    assert all(x in self.supported_class_names for x in self.classes)
+                    self.classes = [self.class_names_inv[x.strip()] for x in self.classes]
+                else:
+                    assert all(x in self.supported_class_keys for x in classes)
+                    self.classes = classes
+                self.inference_dict['classes'] = self.classes
+            elif param.name == 'update_class' and param.type_ == Parameter.Type.STRING:
+                self.update_class = param.value
+                mode = "add"
+                cls = self.update_class
+                if self.update_class.startswith('-'):
+                    mode = "remove"
+                    cls = self.update_class[1:]
+                # check if the class name is supported
+                if cls not in self.supported_class_names:
+                    result.successful = False
+                    result.reason = f"'{cls}' is not a supported class name."
+                    self.get_logger().warn(f"'{cls}' is not a supported class name.")
+                # get the class key
+                cls_key = self.class_names_inv.get(cls.strip(), False)
+                # add or remove the class
+                if (mode == "add") and (cls_key not in self.classes):
+                    self.classes.append(cls_key)
+                    print(f"Added '{cls}' to the list of classes.")
+                elif (mode == "remove") and cls_key:
+                    self.classes.remove(cls_key)
+                    print(f"Removed '{cls}' from the list of classes.")
+                self.inference_dict['classes'] = self.classes
             elif param.name == 'agnostic_nms' and param.type_ == Parameter.Type.BOOL:
                 self.agnostic_nms = param.value
+                self.inference_dict['agnostic_nms'] = self.agnostic_nms
             elif param.name == 'augment' and param.type_ == Parameter.Type.BOOL:
                 self.augment = param.value
+                self.inference_dict['augment'] = self.augment
             elif param.name == 'verbose' and param.type_ == Parameter.Type.BOOL:
                 self.verbose = param.value
                 os.environ['YOLO_VERBOSE'] = str(self.verbose)
+                self.inference_dict['verbose'] = self.verbose
             elif param.name == 'static_camera_info' and param.type_ == Parameter.Type.BOOL:
                 self.static_camera_info = param.value
             else:
