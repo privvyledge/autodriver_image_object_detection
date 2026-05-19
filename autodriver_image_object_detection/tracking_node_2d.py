@@ -1,37 +1,12 @@
-import time
-import struct
-import rclpy
-from rclpy.node import Node
-from rclpy.parameter import Parameter
-from rclpy import qos
-from rclpy.time import Time
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-from rcl_interfaces.msg import ParameterDescriptor, ParameterType
-from std_msgs.msg import Header, ColorRGBA
-from sensor_msgs.msg import Image, CompressedImage, CameraInfo, Imu, PointCloud2, PointField
-from vision_msgs.msg import Detection2D, Detection2DArray, Detection3D, Detection3DArray, ObjectHypothesisWithPose
-from nav_msgs.msg import Odometry
-from geometry_msgs.msg import TransformStamped
-from sensor_msgs_py import point_cloud2
-from sensor_msgs_py.point_cloud2 import read_points, create_cloud
-from image_geometry import PinholeCameraModel
-from message_filters import Subscriber, TimeSynchronizer, ApproximateTimeSynchronizer
-from visualization_msgs.msg import Marker, MarkerArray
-from geometry_msgs.msg import Point, Vector3, Pose, Quaternion
-from derived_object_msgs.msg import Object, ObjectArray
-from shape_msgs.msg import SolidPrimitive
-import tf2_ros
-from tf2_ros import TransformBroadcaster, TransformListener, Buffer, LookupException, ConnectivityException, \
-    ExtrapolationException
-import tf_transformations
 import numpy as np
-import transforms3d
-from tf_transformations import quaternion_matrix, quaternion_from_matrix
-from cv_bridge import CvBridge
+import rclpy
 import cv2
 import torch
-import torch.utils.dlpack
-from ultralytics import YOLO
+from cv_bridge import CvBridge
+from message_filters import Subscriber, ApproximateTimeSynchronizer
+from rcl_interfaces.msg import ParameterDescriptor, ParameterType
+from sensor_msgs.msg import Image
+from vision_msgs.msg import Detection2D, Detection2DArray, ObjectHypothesisWithPose
 
 from ultralytics.engine.results import Boxes
 from ultralytics.trackers.basetrack import BaseTrack
@@ -39,50 +14,41 @@ from ultralytics.trackers import BOTSORT, BYTETracker
 from ultralytics.utils import IterableSimpleNamespace, yaml_load
 from ultralytics.utils.checks import check_requirements, check_yaml
 
+from autodriver_image_object_detection.base_detector import BaseDetector
 
-class TrackingNode(Node):
+
+class TrackingNode(BaseDetector):
     def __init__(self):
-        super(TrackingNode, self).__init__('tracking_node_2d')
+        super().__init__('tracking_node_2d')
+
         self.declare_parameter('tracker_2d', 'bytetrack.yaml')
         self.declare_parameter('fps', 30)
         self.declare_parameter('queue_size', 10)
         self.declare_parameter('synchronization_interval', 0.1)
         self.declare_parameter('use_gpu', True)
-        self.declare_parameter(name='show_image', value=False, descriptor=ParameterDescriptor(
-                description='',
-                type=ParameterType.PARAMETER_BOOL))
-        self.declare_parameter(name='qos', value="SENSOR_DATA", descriptor=ParameterDescriptor(
-                description='',
-                type=ParameterType.PARAMETER_STRING))
+        self.declare_parameter('show_image', False,
+                               ParameterDescriptor(type=ParameterType.PARAMETER_BOOL))
+        self.declare_parameter('qos', 'SENSOR_DATA',
+                               ParameterDescriptor(type=ParameterType.PARAMETER_STRING))
 
-        # Get parameters
-        self.use_sim_time = self.get_parameter('use_sim_time').value
-        self.tracker_2d = self.get_parameter('tracker_2d').value
-        self.fps = self.get_parameter('fps').value
-        self.queue_size = self.get_parameter('queue_size').value
-        self.synchronization_interval = self.get_parameter('synchronization_interval').value
-        self.use_gpu = self.get_parameter('use_gpu').value
-        self.show_image = self.get_parameter('show_image').value
-        self.qos = self.get_parameter('qos').value
+        gp = self.get_parameter
+        self.tracker_2d = gp('tracker_2d').value
+        self.fps = gp('fps').value
+        self.queue_size = gp('queue_size').value
+        self.synchronization_interval = gp('synchronization_interval').value
+        self.use_gpu = gp('use_gpu').value
+        self.show_image = gp('show_image').value
+        self.qos = gp('qos').value
+
+        # Setup device (sets self.device / self.torch_device)
+        self._setup_device()
 
         # Create the tracker
         self.tracker = self.create_tracker(self.tracker_2d, fps=self.fps, use_gpu=self.use_gpu)
 
-        # Initialize variables
         self.bridge = CvBridge()
 
-        # Setup QoS
-        qos_profile = QoSProfile(
-                reliability=QoSReliabilityPolicy.RELIABLE,
-                history=QoSHistoryPolicy.KEEP_LAST,
-                depth=self.queue_size
-        )
-        if self.qos.lower() == "sensor_data":
-            qos_profile = QoSProfile(
-                    reliability=QoSReliabilityPolicy.BEST_EFFORT,
-                    history=QoSHistoryPolicy.KEEP_LAST,
-                    depth=self.queue_size
-            )
+        qos_profile = self._build_qos_profile()
 
         # Subscribers
         self.image_sub = Subscriber(self, Image, "image_raw", qos_profile=qos_profile)
@@ -201,11 +167,12 @@ def main(args=None):
     node = TrackingNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
-        node.get_logger().info("Shutting down node...")
+    except (KeyboardInterrupt, SystemExit):
+        node.get_logger().info('Shutting down...')
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

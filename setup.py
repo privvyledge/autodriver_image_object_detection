@@ -66,6 +66,7 @@ setup(
                 'single_stream_detector = autodriver_image_object_detection.single_stream_detector:main',
                 'multi_stream_detector = autodriver_image_object_detection.multi_stream_detector:main',
                 'tracking_node_2d = autodriver_image_object_detection.tracking_node_2d:main',
+                'depth_fusion_node = autodriver_image_object_detection.depth_fusion_node:main',
             ],
         },
 )

@@ -178,3 +178,63 @@ def cluster_pointcloud(points_xyz: np.ndarray, eps: float = 0.3, min_samples: in
             continue
         clusters.append(points_xyz[labels == label])
     return clusters
+
+
+def create_marker(marker_id, x, y, z, size_x, size_y, size_z,
+                  frame_id, timestamp=None, track_id=None, quat=None, rgba=None):
+    """Create a visualization_msgs/Marker CUBE for a 3D detection.
+
+    Args:
+        marker_id: Integer marker ID (must be unique within a MarkerArray).
+        x, y, z: Centre position in metres.
+        size_x, size_y, size_z: Box half-extents in metres (clamped to ≥0.01).
+        frame_id: Header frame ID string.
+        timestamp: ROS stamp message; defaults to zero-stamp if None.
+        track_id: If provided, colour is derived from the hash of this value.
+        quat: geometry_msgs/Quaternion for orientation; identity if None.
+        rgba: [r, g, b, a] floats in [0,1]; red (1,0,0,0.5) if None.
+
+    Returns:
+        visualization_msgs/Marker
+    """
+    import rclpy.duration
+    from visualization_msgs.msg import Marker
+
+    if rgba is None:
+        rgba = [1.0, 0.0, 0.0, 0.5]
+
+    marker = Marker()
+    marker.header.frame_id = frame_id
+    if timestamp is not None:
+        marker.header.stamp = timestamp
+    marker.ns = 'depth_fusion'
+    marker.id = int(marker_id)
+    marker.type = Marker.CUBE
+    marker.action = Marker.ADD
+
+    marker.pose.position.x = float(x)
+    marker.pose.position.y = float(y)
+    marker.pose.position.z = float(z)
+    if quat is not None:
+        marker.pose.orientation = quat
+    else:
+        marker.pose.orientation.w = 1.0
+
+    marker.scale.x = max(float(size_x), 0.01)
+    marker.scale.y = max(float(size_y), 0.01)
+    marker.scale.z = max(float(size_z), 0.01)
+
+    if track_id is not None:
+        h = hash(str(track_id))
+        marker.color.r = float((h & 0xFF0000) >> 16) / 255.0
+        marker.color.g = float((h & 0x00FF00) >> 8) / 255.0
+        marker.color.b = float(h & 0x0000FF) / 255.0
+        marker.color.a = 0.7
+    else:
+        marker.color.r = float(rgba[0])
+        marker.color.g = float(rgba[1])
+        marker.color.b = float(rgba[2])
+        marker.color.a = float(rgba[3])
+
+    marker.lifetime = rclpy.duration.Duration(seconds=0.5).to_msg()
+    return marker
