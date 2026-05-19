@@ -11,21 +11,51 @@ Todo:
         * https://github.com/ultralytics/ultralytics/blob/main/examples/YOLOv8-Region-Counter/yolov8_region_counter.py
         * https://github.com/ultralytics/ultralytics/blob/main/ultralytics/solutions/trackzone.py
         * https://docs.ultralytics.com/guides/region-counting/#real-world-applications
-     4. Add support for disabling plotting of masks, labels, boxes, probs, etc in show/publish_debug_image namespace
-     5. Add add_class and remove_class parameters/services
+     4. Add support for disabling plotting of masks, labels, boxes, probs, etc in show/publish_debug_image namespace [done: no need]
+     5. Add add_class and remove_class parameters/services [done]
      6. Add support for snapshot mode. I.e triggers a service if num_detections > 0 for rosbag/video recording e.g recording motion only
 """
 import os
+import sys
 import time
 import uuid
 import struct
+import tempfile
 from collections import defaultdict
+
+import yaml
+import numpy as np
+
+try:
+    import scipy
+    from scipy.spatial.transform import Rotation as R
+    SCIPY_INSTALLED = True
+    SCIPY_VERSION = scipy.__version__
+except ImportError:
+    SCIPY_INSTALLED = False
+    SCIPY_VERSION = '0.0.0'
+
+try:
+    import tf_transformations
+    from tf_transformations import quaternion_matrix, quaternion_from_matrix
+    TF_TRANSFORMATIONS_INSTALLED = True
+except ImportError:
+    TF_TRANSFORMATIONS_INSTALLED = False
+
+import cv2
+import torch
+import torch.utils.dlpack
+import ultralytics
+
+from cv_bridge import CvBridge
 import rclpy
 from rclpy.node import Node
+from ament_index_python.packages import get_package_share_directory
 from rclpy.parameter import Parameter
 from rclpy import qos
 from rclpy.time import Time
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+from rclpy.executors import ExternalShutdownException
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType, SetParametersResult
 from std_msgs.msg import Header, ColorRGBA
 from sensor_msgs.msg import Image, CompressedImage, CameraInfo, Imu, PointCloud2, PointField
@@ -47,156 +77,75 @@ except ImportError:
 import tf2_ros
 from tf2_ros import TransformBroadcaster, TransformListener, Buffer, LookupException, ConnectivityException, \
     ExtrapolationException
-import tf_transformations
-import numpy as np
-import transforms3d
-from tf_transformations import quaternion_matrix, quaternion_from_matrix
 
-from cv_bridge import CvBridge
-import cv2
-import torch
-import torch.utils.dlpack
-import ultralytics
-
-
-def pack_2d_detection(x, y, size_x, size_y, class_id, conf, id):
-    detection = Detection2D()
-    detection.bbox.center.position.x = float(x)
-    detection.bbox.center.position.y = float(y)
-    detection.bbox.size_x = float(size_x)
-    detection.bbox.size_y = float(size_y)
-    detection.id = str(id)
-    hypothesis = ObjectHypothesisWithPose()
-    hypothesis.hypothesis.class_id = class_id
-    hypothesis.hypothesis.score = float(conf)
-    detection.results.append(hypothesis)
-    return detection
-
-
-def pack_nav2_obstacle_msg(x, y, size_x, size_y, class_id, conf, id=None, z_size=1.0):
-    if id in (None, -1):
-        uuid_ = uuid.uuid4()
-    else:
-        uuid_ = uuid.UUID(int=id)
-        # or
-        #id_str = str(id)
-        #uuid_ = uuid.uuid5(uuid.NAMESPACE_DNS, id_str)
-
-    obstacle_msg = Obstacle()
-    obstacle_msg.uuid.uuid = list(uuid_.bytes)
-    obstacle_msg.score = float(conf)
-    obstacle_msg.position.x = float(x)
-    obstacle_msg.position.y = float(y)
-    obstacle_msg.size.x = float(size_x)
-    obstacle_msg.size.y = float(size_y)
-    obstacle_msg.size.z = float(z_size)  # 0.0
-    return obstacle_msg
-
-def pack_derived_object_msg(x, y, size_x, size_y, class_id, conf, id=None, z_size=1.0):
-    """Convert a nav2_dynamic_msgs/Obstacle into a derived_object_msgs/Object."""
-    obj = Object()
-    # Convert first 4 bytes of the obstacle's UUID into a uint32 id.
-    if id in (None, -1):
-        id = 10000000
-    obj.id = id
-
-    # Set detection level. Here we assume that an obstacle from tracking
-    # is equivalent to a TRACKED object.
-    obj.detection_level = Object.OBJECT_TRACKED
-
-    # Set pose. Use the obstacle's position and set a default orientation.
-    obj.pose.position = Point(x=float(x), y=float(y), z=0.0)
-    obj.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
-
-    # Set twist using the obstacle's velocity; angular part is set to zero.
-    obj.twist.linear = Vector3(x=0.0, y=0.0, z=0.0)
-    obj.twist.angular = Vector3(x=0.0, y=0.0, z=0.0)
-
-    # Set acceleration to zero (no info available).
-    obj.accel.linear = Vector3(x=0.0, y=0.0, z=0.0)
-    obj.accel.angular = Vector3(x=0.0, y=0.0, z=0.0)
-
-    # Leave polygon empty.
-    # Convert obstacle size into a SolidPrimitive shape (assuming a box).
-    sp = SolidPrimitive()
-    sp.type = SolidPrimitive.BOX
-    sp.dimensions = [float(size_x), float(size_y), z_size]
-    obj.shape = sp
-
-    # Set classification fields to defaults.
-    obj.classification = {
-        'car': Object.CLASSIFICATION_CAR,
-        'truck': Object.CLASSIFICATION_TRUCK,
-        'bus': Object.CLASSIFICATION_OTHER_VEHICLE,
-        'person': Object.CLASSIFICATION_PEDESTRIAN,
-        'motorcycle': Object.CLASSIFICATION_MOTORCYCLE,
-        'bicycle': Object.CLASSIFICATION_BIKE,
-        'train': Object.CLASSIFICATION_OTHER_VEHICLE,
-        'airplane': Object.CLASSIFICATION_UNKNOWN_BIG,
-        'boat': Object.CLASSIFICATION_UNKNOWN_MEDIUM,
-    }.get(class_id, Object.CLASSIFICATION_UNKNOWN)  # Object.CLASSIFICATION_UNKNOWN_SMALL
-
-    # Mark the object as classified if the detection score is high.
-    obj.object_classified = bool(conf > 0.25)  # same as conf_threshold
-    
-    # Convert the obstacle score (0-1) to a certainty value (0-255)
-    obj.classification_certainty = int(conf * 255)
-    obj.classification_age = 0
-
-    return obj
-
+from autodriver_image_object_detection.utils.common import pack_2d_detection, pack_nav2_obstacle_msg, pack_derived_object_msg, update_tracker_param
+from autodriver_image_object_detection.utils.imaging_utils import parse_image_message
 
 class SingleStreamDetector(Node):
     def __init__(self):
+        this_package_dir = get_package_share_directory('autodriver_image_object_detection')
         super(SingleStreamDetector, self).__init__("single_stream_detector")
 
         # Declare parameters
-        self.declare_parameter(name='input_image_topic', value="/camera/camera/color/image_raw",
+        self.declare_parameter(name='input_image_topic', value="carla/ego_vehicle/rgb_front/image",  # "camera/image_raw", camera/color/image_raw, carla/ego_vehicle/rgb_front/image
                                descriptor=ParameterDescriptor(
-                                       description='The input image topic. '
-                                                   'Works with all image types: RGB(A), BGR(A), mono8, mono16.',
-                                       type=ParameterType.PARAMETER_STRING))
-        self.declare_parameter(name='input_camera_info_topic', value="/camera/camera/color/camera_info",
+                                   description='The input image topic. '
+                                               'Works with all image types: RGB(A), BGR(A), mono8, mono16.',
+                                   type=ParameterType.PARAMETER_STRING))
+        self.declare_parameter(name='input_camera_info_topic', value="carla/ego_vehicle/rgb_front/camera_info",  # camera/color/camera_info, carla/ego_vehicle/rgb_front/camera_info
+                               # "camera/camera_info",
                                descriptor=ParameterDescriptor(
-                                       description='',
-                                       type=ParameterType.PARAMETER_STRING))
+                                   description='',
+                                   type=ParameterType.PARAMETER_STRING))
         self.declare_parameter(name='input_image_topic_is_compressed', value=False, descriptor=ParameterDescriptor(
-                description='',
-                type=ParameterType.PARAMETER_BOOL))
-        self.declare_parameter(name='detection_results_topic', value="/yolo/detection_results",
+            description='',
+            type=ParameterType.PARAMETER_BOOL))
+        self.declare_parameter(name='detection_results_topic', value="yolo/detection_results",
                                descriptor=ParameterDescriptor(
-                                       description='',
-                                       type=ParameterType.PARAMETER_STRING))
+                                   description='',
+                                   type=ParameterType.PARAMETER_STRING))
         self.declare_parameter('publish_debug_image', True)
-        self.declare_parameter(name='detection_image_topic', value="/yolo/detection_image",
+        self.declare_parameter(name='detection_image_topic', value="yolo/detection_image",
                                descriptor=ParameterDescriptor(
-                                       description='',
-                                       type=ParameterType.PARAMETER_STRING))
-        self.declare_parameter(name='segmentation_image_topic', value="/yolo/segmentation_image",
+                                   description='',
+                                   type=ParameterType.PARAMETER_STRING))
+        self.declare_parameter(name='segmentation_image_topic', value="yolo/segmentation_image",
                                descriptor=ParameterDescriptor(
-                                       description='',
-                                       type=ParameterType.PARAMETER_STRING))
-        self.declare_parameter(name='segmentation_mask_image_topic', value="/yolo/segmentation_mask_image",
+                                   description='',
+                                   type=ParameterType.PARAMETER_STRING))
+        self.declare_parameter(name='segmentation_mask_image_topic', value="yolo/segmentation_mask_image",
                                descriptor=ParameterDescriptor(
-                                       description='',
-                                       type=ParameterType.PARAMETER_STRING))
+                                   description='',
+                                   type=ParameterType.PARAMETER_STRING))
 
         self.declare_parameter(name='qos', value="SENSOR_DATA", descriptor=ParameterDescriptor(
-                description='',
-                type=ParameterType.PARAMETER_STRING))
+            description='',
+            type=ParameterType.PARAMETER_STRING))
         self.declare_parameter(name='model_path', value="yolo11n-seg.engine",
                                descriptor=ParameterDescriptor(
-                                       description='',
-                                       type=ParameterType.PARAMETER_STRING))
+                                   description='',
+                                   type=ParameterType.PARAMETER_STRING))
         self.declare_parameter(name='export_model_format', value='',
                                descriptor=ParameterDescriptor(
-                                       description='Export the model to one of the supported formats '
-                                                   'if the file does not exist. '
-                                                   'See https://docs.ultralytics.com/modes/export/#export-formats '
-                                                   'for supported formats.',
-                               type=ParameterType.PARAMETER_BOOL))
+                                   description='Export the model to one of the supported formats '
+                                               'if the file does not exist. '
+                                               'See https://docs.ultralytics.com/modes/export/#export-formats '
+                                               'for supported formats.',
+                                   type=ParameterType.PARAMETER_BOOL))
         self.declare_parameter('track_2d', True)
-        self.declare_parameter('tracker_2d', 'bytetrack.yaml')
+        self.declare_parameter('tracker_2d.path', os.path.join(this_package_dir, 'config', 'tracker_custom.yaml'))
+        self.declare_parameter('tracker_2d.tracker_type', 'bytetrack')
+        self.declare_parameter('tracker_2d.track_high_thresh', -1.0)
+        self.declare_parameter('tracker_2d.track_low_thresh', -1.0)
+        self.declare_parameter('tracker_2d.new_track_thresh', -1.0)
+        self.declare_parameter('tracker_2d.track_buffer', -1)
+        self.declare_parameter('tracker_2d.match_thresh', -1.0)
+        self.declare_parameter('tracker_2d.fuse_score', True)
+        self.declare_parameter('tracker_2d.gmc_method', '')
+        self.declare_parameter('tracker_2d.proximity_thresh', -1.0)
+        self.declare_parameter('tracker_2d.appearance_thresh', -1.0)
+        self.declare_parameter('tracker_2d.with_reid', True)
+        self.declare_parameter('tracker_2d.model', 'auto')
         self.declare_parameter('plot_tracks', True)
         self.declare_parameter('queue_size', 1)
         self.declare_parameter('use_gpu', True)
@@ -204,23 +153,28 @@ class SingleStreamDetector(Node):
                 description='',
                 type=ParameterType.PARAMETER_BOOL))
         self.declare_parameter(name="use_image_dimensions", value=True, descriptor=ParameterDescriptor(
-                description='Whether to use the image dimensions when running inference or using a fixed square image '
-                            'size for the model. Setting to True typically yields better performance.',
-                type=ParameterType.PARAMETER_BOOL))
-        self.declare_parameter(name="image_dimensions", value=(480, 640), descriptor=ParameterDescriptor(
-                description='The image dimensions to use when running inference. '
-                            'Must be set if exporting the model to another format, '
-                            'e.g TensorRT .engine since that is compiled with a fixed size.',
-                type=ParameterType.PARAMETER_INTEGER_ARRAY
+            description='Whether to use the image dimensions when running inference or using a fixed square image '
+                        'size for the model. '
+                        'Setting to True typically yields better performance when running models exported with '
+                        'dynamic shapes but is generally slower with False. '
+                        'False: faster with fixed size/batch exports.',
+            type=ParameterType.PARAMETER_BOOL))
+        self.declare_parameter(name="image_dimensions", value=[640, 640], descriptor=ParameterDescriptor(
+            description='The image dimensions to use when running inference. '
+                        'Must be set if exporting the model to another format, '
+                        'e.g TensorRT .engine since that is compiled with a fixed size. '
+                        'Examples: [480, 640], [1080, 1920]. Default: [640, 640].',
+            type=ParameterType.PARAMETER_INTEGER_ARRAY
         ))
         self.declare_parameter("resize_image", False)
         self.declare_parameter("half_precision", True)
-        self.declare_parameter("conf_thresh", 0.25)
-        self.declare_parameter("iou_thresh", 0.45)
-        self.declare_parameter("max_det", 300)
-        self.declare_parameter("classes", ['person', 'car', 'bicycle', 'motorcycle', 'bus', 'truck'])  # [] or ['person', 'car'] or [0, 2]
+        self.declare_parameter("conf_thresh", 0.55)
+        self.declare_parameter("iou_thresh", 0.55)
+        self.declare_parameter("max_det", 50)
+        self.declare_parameter("classes", ['person', 'car', 'bicycle', 'motorcycle', 'bus',
+                                           'truck'])  # [] or ['person', 'car'] or [0, 2]
         self.declare_parameter("update_class", "")  # type "class_name" to add or "-class_name" to delete
-        self.declare_parameter("agnostic_nms", False)
+        self.declare_parameter("agnostic_nms", True)
         self.declare_parameter("augment", False)
         self.declare_parameter("verbose", False)
         self.declare_parameter('static_camera_info', True)
@@ -229,17 +183,21 @@ class SingleStreamDetector(Node):
         self.use_sim_time = self.get_parameter('use_sim_time').get_parameter_value().bool_value
         self.input_image_topic = self.get_parameter('input_image_topic').get_parameter_value().string_value
         self.input_camera_info_topic = self.get_parameter('input_camera_info_topic').get_parameter_value().string_value
-        self.input_image_topic_is_compressed = self.get_parameter('input_image_topic_is_compressed').get_parameter_value().bool_value
+        self.input_image_topic_is_compressed = self.get_parameter(
+            'input_image_topic_is_compressed').get_parameter_value().bool_value
         self.detection_results_topic = self.get_parameter('detection_results_topic').get_parameter_value().string_value
         self.publish_debug_image = self.get_parameter('publish_debug_image').get_parameter_value().bool_value
         self.detection_image_topic = self.get_parameter('detection_image_topic').get_parameter_value().string_value
-        self.segmentation_image_topic = self.get_parameter('segmentation_image_topic').get_parameter_value().string_value
-        self.segmentation_mask_image_topic = self.get_parameter('segmentation_mask_image_topic').get_parameter_value().string_value
+        self.segmentation_image_topic = self.get_parameter(
+            'segmentation_image_topic').get_parameter_value().string_value
+        self.segmentation_mask_image_topic = self.get_parameter(
+            'segmentation_mask_image_topic').get_parameter_value().string_value
         self.qos = self.get_parameter('qos').get_parameter_value().string_value
         self.model_path = self.get_parameter('model_path').get_parameter_value().string_value
         self.export_model_format = self.get_parameter('export_model_format').get_parameter_value().string_value
         self.track_2d = self.get_parameter('track_2d').get_parameter_value().bool_value
-        self.tracker_2d = self.get_parameter('tracker_2d').get_parameter_value().string_value
+        self.tracker_2d_cfg = self.get_parameters_by_prefix('tracker_2d')
+        self.tracker_2d_cfg = {k: v.value for k, v in self.tracker_2d_cfg.items()}
         self.plot_tracks = self.get_parameter('plot_tracks').get_parameter_value().bool_value
         self.queue_size = self.get_parameter('queue_size').get_parameter_value().integer_value
         self.use_gpu = self.get_parameter('use_gpu').get_parameter_value().bool_value
@@ -267,8 +225,8 @@ class SingleStreamDetector(Node):
             if torch.cuda.is_available():
                 self.device = 'cuda:0'  # 'cuda'
                 self.torch_device = torch.device('cuda:0')
-        else:
-            self.use_gpu = False
+            else:
+                self.use_gpu = False
 
         # Initialize variables
         self.image_frame_id = None
@@ -315,7 +273,7 @@ class SingleStreamDetector(Node):
             )
 
             self.get_logger().info(f"Exported model to {self.export_model_format} format: {self.model_path}")
-            self.model_path = self.model_path.split('.')[:-1] + '.' + self.export_model_format
+            self.model_path = self.model_path.rsplit('.', 1)[0] + '.' + self.export_model_format  # self.model_path.rsplit('.', 1)[:-1]
 
         # if model_path ends with .engine or .onnx, try loading the file and export if FileNotFoundError
         if self.model_path.split('.')[-1] in ['engine', 'onnx']:
@@ -341,13 +299,17 @@ class SingleStreamDetector(Node):
                         dynamic=True,
                         device=self.device
                 )
-                self.model_path = self.model_path.split('.')[0] + '.' + self.model_path.split('.')[-1]
+                # self.model_path = self.model_path.split('.')[0] + '.' + self.model_path.split('.')[-1]
 
         # Initialize model
         self.model = model_class(
                 self.model_path,
                 # task=self.task,
-        ).to(self.torch_device)
+        )
+        try:
+            self.model.to(self.torch_device)
+        except TypeError:
+            pass
 
         # Filter classes
         self.class_names: dict[int, str] = self.model.names
@@ -362,7 +324,8 @@ class SingleStreamDetector(Node):
                 assert self.classes < num_model_classes
                 self.classes = [self.classes]
             elif isinstance(self.classes, str):
-                self.classes = [int(x.strip()) for x in self.classes.split(',')]  # assert all ints less than num_model_classes
+                self.classes = [int(x.strip()) for x in
+                                self.classes.split(',')]  # assert all ints less than num_model_classes
                 assert all(x < num_model_classes for x in self.classes)
             elif isinstance(self.classes, list):
                 # remove empty strings from the list but keep 0
@@ -442,6 +405,26 @@ class SingleStreamDetector(Node):
             'verbose': self.verbose
         }
 
+        # (optional) modify tracker parameters
+        if self.track_2d:
+            with open(self.tracker_2d_cfg['path'], 'r') as file:
+                tracker_config = yaml.safe_load(file)
+
+            for k, new_v in self.tracker_2d_cfg.copy().items():
+                if k in tracker_config.keys():
+                    tracker_config[k] = update_tracker_param(k, new_value=new_v, old_value=tracker_config[k])
+
+            assert tracker_config['tracker_type'] in [
+                "bytetrack",
+                "botsort",
+            ], f"Only 'bytetrack' and 'botsort' are supported for now, but got '{tracker_config['tracker_type']}'"
+
+            # Create a temporary file
+            self.temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.yaml')
+            yaml.safe_dump(tracker_config, self.temp_file, default_flow_style=False, sort_keys=False)
+
+            self.tracker_2d_cfg['path'] = self.temp_file.name
+
         # Setup dynamic parameter reconfiguring.
         # Register a callback function that will be called whenever there is an attempt to
         # change one or more parameters of the node.
@@ -463,12 +446,13 @@ class SingleStreamDetector(Node):
         self.detection_results_pub = self.create_publisher(
                 Detection2DArray,
                 self.detection_results_topic,
-                qos_profile)
+                self.queue_size,  # qos_profile
+        )
 
         self.object_array_pub = self.create_publisher(
                 ObjectArray,
                 'yolo/objects',
-                qos_profile
+                self.queue_size,  # qos_profile
         )
 
         try:
@@ -480,15 +464,18 @@ class SingleStreamDetector(Node):
             self.detection_image_pub = self.create_publisher(
                     self.image_message_type,
                     self.detection_image_topic,
-                    qos_profile)
+                    self.queue_size  # qos_profile,  # use Best Effort for publishing
+            )
             self.segmentation_image_pub = self.create_publisher(
                     self.image_message_type,
                     self.segmentation_image_topic,
-                    qos_profile)
+                    self.queue_size  # qos_profile,  # use Best Effort for publishing
+            )
             self.segmentation_mask_image_pub = self.create_publisher(
                     self.image_message_type,
                     self.segmentation_mask_image_topic,
-                    qos_profile)
+                    self.queue_size  # qos_profile,  # use Best Effort for publishing
+            )
 
         self.get_logger().info(
             (
@@ -499,6 +486,9 @@ class SingleStreamDetector(Node):
         )
 
     def image_callback(self, msg):
+        if self.camera_info is None:
+            self.get_logger().warn("No CameraInfo received yet — skipping frame.", once=True)
+            return
         try:
             msg_timestamp = None
             msg_fmt = "bgr8"
@@ -506,8 +496,8 @@ class SingleStreamDetector(Node):
             inverse_conversion = None
             is_color = True
             is_depth = False
-            cv_image, msg_encoding, image_frame_id, msg_timestamp, msg_fmt, conversion, inverse_conversion, is_color, is_depth, compressed_msg_codec = self.parse_image_message(
-                msg)
+            cv_image, msg_encoding, image_frame_id, msg_timestamp, msg_fmt, conversion, inverse_conversion, is_color, is_depth, compressed_msg_codec = parse_image_message(
+                msg, self.bridge, self.image_message_format, logger=self.get_logger())
 
             # get image dimensions
             if self.imgsz is None:
@@ -521,13 +511,13 @@ class SingleStreamDetector(Node):
                     self.imgsz = (new_height, new_width)
                     self.get_logger().info(f"Using image dimensions: {self.imgsz}")
                 else:
-                    self.imgsz = (640, 640)
+                    self.imgsz = list(self.image_dimensions)  # [640, 640]
 
             self.inference_dict['imgsz'] = self.imgsz
             # (optional) resize the image
             if self.resize_image and self.use_image_dimensions and (
                     (self.image_height, self.image_width) != (self.imgsz[0], self.imgsz[1])):
-                cv_image = cv2.resize(cv_image, (self.imgsz[1], self.imgsz[0]), interpolation=cv2.INTER_LINEAR)
+                cv_image = cv2.resize(cv_image, (self.imgsz[1], self.imgsz[0]))  # , interpolation=cv2.INTER_LINEAR
 
             # detect/track objects in the visual image
             self.detect_objects(cv_image)
@@ -569,8 +559,9 @@ class SingleStreamDetector(Node):
                         self.segmentation_mask_image_pub.publish(mask_image_msg)
 
                     if self.segmentation_image_topic and (mask_img is not None):
-                        # color_mask_img = cv2.cvtColor(mask_img, cv2.COLOR_GRAY2BGR)
-                        cv_image_inverted = cv2.cvtColor(cv_image, inverse_conversion)
+                        cv_image_inverted = cv_image
+                        if inverse_conversion is not None:
+                            cv_image_inverted = cv2.cvtColor(cv_image, inverse_conversion)
                         color_mask_img = cv2.bitwise_and(cv_image_inverted, cv_image_inverted, mask=mask_img)
                         if self.show_image:
                             cv2.imshow("color_mask_image", color_mask_img)
@@ -583,7 +574,7 @@ class SingleStreamDetector(Node):
                         else:
                             color_mask_image_msg = self.bridge.cv2_to_imgmsg(
                                     color_mask_img,
-                                    encoding=msg_fmt)
+                                    encoding=msg_fmt)  # passthrough
 
                         color_mask_image_msg.header.frame_id = image_frame_id
                         color_mask_image_msg.header.stamp = msg_timestamp
@@ -605,79 +596,13 @@ class SingleStreamDetector(Node):
             self.camera_info = msg
             self.camera_model.fromCameraInfo(msg)
 
-    def parse_image_message(self, msg):
-        image_frame_id = msg.header.frame_id
-        msg_timestamp = msg.header.stamp
-        msg_fmt = "bgr8"
-        compressed_msg_codec = None
-        conversion = None
-        inverse_conversion = None
-        is_color = True
-        is_depth = False
-        if self.image_message_format == "raw":
-            msg_encoding = msg.encoding
-
-        elif self.image_message_format == 'compressed':
-            # format: rgb8; jpeg compressed bgr8
-            msg_info = msg.format
-            msg_encoding_split = msg_info.split(';')
-            uncompressed_msg_fmt = msg_encoding_split[0]
-            compressed_img_info = msg_encoding_split[1].split()
-            compressed_msg_codec = compressed_img_info[0]
-            msg_encoding = compressed_img_info[-1]
-
-        # set the desired output encoding
-        # (http://wiki.ros.org/cv_bridge/Tutorials/UsingCvBridgeToConvertBetweenROSImagesAndOpenCVImages#cv_bridge.2FTutorials.2FUsingCvBridgeCppDiamondback.Converting_ROS_image_messages_to_OpenCV_images)
-        if (msg_encoding.find("mono8") != -1) or (msg_encoding.find("8UC1") != -1):
-            msg_fmt = "mono8"  # "8UC1"
-            is_color = False
-            conversion = cv2.COLOR_GRAY2BGR
-            inverse_conversion = cv2.COLOR_BGR2GRAY
-        elif msg_encoding.find("bgra") != -1:
-            msg_fmt = "bgra8"  # "8UC4"
-            conversion = cv2.COLOR_BGRA2BGR
-            inverse_conversion = cv2.COLOR_BGR2BGRA
-        elif msg_encoding.find("rgba") != -1:
-            msg_fmt = "rgba8"  # "8UC4"
-            conversion = cv2.COLOR_RGBA2BGR
-            inverse_conversion = cv2.COLOR_BGR2RGBA
-        elif msg_encoding.find("bgr8") != -1:
-            msg_fmt = "bgr8"  # or 8UC3
-            # conversion = cv2.COLOR_BGR2BGR
-            # inverse_conversion = cv2.COLOR_BGR2BGR
-        elif (msg_encoding.find("rgb8") != -1):
-            msg_fmt = "rgb8"  # or 8UC3
-            conversion = cv2.COLOR_RGB2BGR
-            inverse_conversion = cv2.COLOR_BGR2RGB
-        elif msg_encoding.find("16UC1") != -1:
-            msg_fmt = "16UC1"  # "16UC1", mono16
-            is_color = False
-            is_depth = True
-            # raise NotImplementedError("Depth images are not supported for YOLO detection")
-            #conversion = cv2.COLOR_GRAY2BGR
-            #inverse_conversion = cv2.COLOR_BGR2GRAY
-        else:
-            self.get_logger().error(f"Unsupported encoding: {msg_encoding}")
-            self.exit(1)
-
-        # convert ROS2 image message to OpenCV
-        if self.image_message_format in ("compressed", "packet"):
-            cv_image = self.bridge.compressed_imgmsg_to_cv2(msg, msg_fmt)
-        else:
-            cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding=msg_fmt)
-
-        if conversion is not None:
-            cv_image = cv2.cvtColor(cv_image, conversion)
-        return (cv_image, msg_encoding, image_frame_id, msg_timestamp, msg_fmt, conversion, inverse_conversion,
-                is_color, is_depth, compressed_msg_codec)
-
     def detect_objects(self, image):
         try:
             self.inference_dict['source'] = image
             if self.track_2d:
                 # https://docs.ultralytics.com/modes/track/#why-choose-ultralytics-yolo-for-object-tracking
                 self.results = self.model.track(
-                        tracker=self.tracker_2d,
+                        tracker=self.tracker_2d_cfg['path'],
                         persist=True,
                         **self.inference_dict
                 )
@@ -698,7 +623,7 @@ class SingleStreamDetector(Node):
             detections_msg, mask_img = self.create_detections_array(results, header)
 
             return detections_msg, self.detection_image, mask_img
-        return None
+        return None, None, None
 
     def create_detections_array(self, results, header):
         detections_msg = Detection2DArray()
@@ -727,13 +652,18 @@ class SingleStreamDetector(Node):
                     masks=True,
                     probs=True,
                     # # todo: use the image below to specify the original image if passing an ROI masked image to the detector
-                    # img=None,  # numpy image to overlay detections on. This is slower since it needs to be tranferred to GPU
-                    # im_gpu=None,  # torch tensor image to overlay detections on. This is faster since it does not need to be tranferred to GPU
+                    # img=self.inference_dict['source'],  # numpy image to overlay detections on. This is slower since it needs to be transferred to GPU
+                    # im_gpu=None,  # torch tensor image to overlay detections on. This is faster since it does not need to be transferred to GPU
             )
             if self.show_image:
                 # Visualize the results on the frame
                 cv2.imshow("image", self.detection_image)
                 cv2.waitKey(1)
+
+            # use result.cpu().numpy()  # to move all at once. or result.to(device="cpu", dtype=torch.float32)
+            result = result.cpu()
+            # todo: do not hardcode cpu usage as we can postprocess with depth/pointcloud on GPU. Remove cpu() and numpy() calls
+
             bounding_box = result.boxes.cpu()  # Boxes object for bounding box outputs. n x 4
             classes = result.boxes.cls.cpu()  # n,
             confidence_score = result.boxes.conf.cpu()  # n,
@@ -746,7 +676,7 @@ class SingleStreamDetector(Node):
                 return detections_msg, mask_img
 
             track_ids = None
-            if self.track_2d:
+            if self.track_2d and bounding_box.is_track:
                 track_ids = result.boxes.id
                 if track_ids is not None:
                     track_ids = track_ids.int().cpu().tolist()
@@ -809,9 +739,9 @@ class SingleStreamDetector(Node):
 
                 if obstacle_msg is not None:
                     obstacle_2d = pack_nav2_obstacle_msg(
-                        bbox[0], bbox[1], bbox[2], bbox[3], result.names.get(int(cls)), conf, id=track_ids[i] if track_ids is not None else -1)
+                        bbox[0], bbox[1], bbox[2], bbox[3], result.names.get(int(cls)), conf,
+                        id=track_ids[i] if track_ids is not None else -1, z_size=0.0)
                     obstacle_msg.obstacles.append(obstacle_2d)
-
 
             self.object_array_pub.publish(objects_msg)
 
@@ -846,8 +776,9 @@ class SingleStreamDetector(Node):
                 # todo: load the model
             elif param.name == 'track_2d' and param.type_ == Parameter.Type.BOOL:
                 self.track_2d = param.value
-            elif param.name == 'tracker_2d' and param.type_ == Parameter.Type.STRING:
-                self.tracker_2d = param.value
+            elif param.name == 'tracker_2d.path' and param.type_ == Parameter.Type.STRING:
+                self.tracker_2d_cfg['path'] = param.value
+            # todo: add other tracker params
             elif param.name == 'plot_tracks' and param.type_ == Parameter.Type.BOOL:
                 self.plot_tracks = param.value
             elif param.name == 'use_gpu' and param.type_ == Parameter.Type.BOOL:
@@ -894,13 +825,16 @@ class SingleStreamDetector(Node):
             elif param.name == 'classes' and param.type_ in (Parameter.Type.STRING_ARRAY, Parameter.Type.INTEGER_ARRAY):
                 classes = param.value
                 if param.type_ == Parameter.Type.STRING_ARRAY:
-                    assert all(x in self.supported_class_names for x in self.classes)
-                    self.classes = [self.class_names_inv[x.strip()] for x in self.classes]
+                    assert all(x in self.supported_class_names for x in classes)
+                    self.classes = [self.class_names_inv[x.strip()] for x in classes]
                 else:
                     assert all(x in self.supported_class_keys for x in classes)
                     self.classes = classes
                 self.inference_dict['classes'] = self.classes
             elif param.name == 'update_class' and param.type_ == Parameter.Type.STRING:
+                # Update the list of classes based on the update_class parameter.
+                # For CLI, add -- before -class,
+                # e.g ros2 param set /single_stream_detector update_class -- -truck.
                 self.update_class = param.value
                 mode = "add"
                 cls = self.update_class
@@ -922,6 +856,16 @@ class SingleStreamDetector(Node):
                     self.classes.remove(cls_key)
                     print(f"Removed '{cls}' from the list of classes.")
                 self.inference_dict['classes'] = self.classes
+                # update the classes parameter
+                self.set_parameters(
+                        [
+                            rclpy.parameter.Parameter(
+                                'classes',
+                                Parameter.Type.STRING_ARRAY,
+                                [self.class_names[x] for x in self.classes]
+                            )
+                        ]
+                )
             elif param.name == 'agnostic_nms' and param.type_ == Parameter.Type.BOOL:
                 self.agnostic_nms = param.value
                 self.inference_dict['agnostic_nms'] = self.agnostic_nms
@@ -939,13 +883,29 @@ class SingleStreamDetector(Node):
             self.get_logger().info(f"Success = {result.successful} for param {param.name} to value {param.value}")
         return result
 
+    def destroy_node(self):
+        # close OpenCV windows
+        cv2.destroyAllWindows()
+        # the reference to the model
+        del self.model
+        # clear the cuda cache
+        if "cuda" in self.device:
+            self.get_logger().info("Clearing CUDA cache")
+            torch.cuda.empty_cache()
+        # close the temporary file used for the custom tracker settings
+        if self.track_2d:
+            try:
+                self.temp_file.close()
+            except FileNotFoundError:
+                pass
+
 
 def main(args=None):
     rclpy.init(args=args)
     node = SingleStreamDetector()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException, SystemExit):
         node.get_logger().info("Shutting down node...")
     finally:
         node.destroy_node()

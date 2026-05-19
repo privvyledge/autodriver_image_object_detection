@@ -6,12 +6,14 @@ Usage:
     ros2 run autodriver_image_object_detection single_stream_detector
 
 Todo:
+    * ultralytics now supports tracking for multi-streams. However, stream=True must be passed.
     * add support for publishing ObstacleArray and ObjectArray messages similar to single_stream_detector and yolo_detection_node
 """
 
 import time
 import uuid
 import struct
+from pathlib import Path
 from collections import defaultdict
 import rclpy
 from rclpy.node import Node
@@ -49,6 +51,7 @@ import cv2
 import torch
 import torch.utils.dlpack
 import ultralytics
+from autodriver_image_object_detection.utils.imaging_utils import parse_image_message
 
 
 def pack_2d_detection(x, y, size_x, size_y, class_id, conf, id):
@@ -247,7 +250,7 @@ class MultiStreamDetector(Node):
         if self.export_model_format:
             self.get_logger().info(f"Exporting model to {self.export_model_format} format...")
             self.model = model_class(
-                    self.model_path.split('.')[0] + '.pt',
+                    str(Path(self.model_path).with_suffix('.pt')),
                     # task=self.task,
             )  # can only export pytorch models
             self.model.export(
@@ -259,7 +262,7 @@ class MultiStreamDetector(Node):
             )
 
             self.get_logger().info(f"Exported model to {self.export_model_format} format: {self.model_path}")
-            self.model_path = self.model_path.split('.')[:-1] + '.' + self.export_model_format
+            self.model_path = str(Path(self.model_path).with_suffix('.' + self.export_model_format))
 
         # if model_path ends with .engine or .onnx, try loading the file and export if FileNotFoundError
         if self.model_path.split('.')[-1] in ['engine', 'onnx']:
@@ -272,12 +275,13 @@ class MultiStreamDetector(Node):
                 self.get_logger().info(f"Model not found: {self.model_path}. "
                                        f"Trying to export to {self.model_path.split('.')[-1]}.")
 
+                export_format = Path(self.model_path).suffix.lstrip('.')
                 self.model = model_class(
-                        self.model_path.split('.')[0] + '.pt',
+                        str(Path(self.model_path).with_suffix('.pt')),
                         # task=self.task,
                 )  # append .pt to the model path
                 self.model.export(
-                        format=self.model_path.split('.')[-1],
+                        format=export_format,
                         half=self.half_precision,
                         simplify=True,
                         nms=True,
@@ -286,7 +290,7 @@ class MultiStreamDetector(Node):
                         device=self.device,
                         batch=self.num_cameras
                 )
-                self.model_path = self.model_path.split('.')[0] + '.' + self.model_path.split('.')[-1]
+                self.model_path = str(Path(self.model_path).with_suffix('.' + export_format))
 
         # Initialize model
         self.model = model_class(
@@ -386,13 +390,13 @@ class MultiStreamDetector(Node):
                 image_subscriber = self.create_subscription(
                         self.image_message_type,
                         f"{camera}/image_raw",
-                        lambda msg, idx=i: self.image_callback(msg, idx),
+                        lambda msg, idx=i: self.callback_common(msg, idx),
                         qos_profile=qos_profile
                 )
                 camera_info_subscriber = self.create_subscription(
                         CameraInfo,
                         f"{camera}/camera_info",
-                        lambda msg, idx=i: self.image_callback(msg, idx),
+                        lambda msg, cam=camera: self._store_camera_info(msg, cam),
                         qos_profile=qos_profile
                 )
             self.subscriptions_.append(image_subscriber)
@@ -449,9 +453,8 @@ class MultiStreamDetector(Node):
 
         self.get_logger().info(f"image_obstacle_detection_node node started on device: {self.device}")
 
-    def image_callback(self, msg, idx):
-        #self.image_callback_synchronized([msg, None], idx)
-        pass
+    def _store_camera_info(self, msg, camera):
+        self.camera_info[camera] = msg
 
     def image_callback_synchronized(self, *msg):
         for i in range(self.num_cameras):
@@ -506,7 +509,43 @@ class MultiStreamDetector(Node):
 
 
     def timer_callback(self):
-        pass
+        images = list(self.images.values())
+        if any(img is None for img in images):
+            return  # wait until every camera has delivered at least one frame
+
+        self.detect_objects(images)
+
+        if self.results is None:
+            return
+
+        # todo: refactor loops for speed. Use pytorch tensors where necessary to keep on device
+        for i, result in enumerate(self.results):
+            detection_msg, detection_image, mask_img = self.parse_results(
+                    result, self.headers[self.cameras[i]])
+
+            publisher_idx = i * 4 if self.publish_debug_image else i
+            self.publishers_[publisher_idx].publish(detection_msg)
+
+            if detection_image is not None and self.publish_debug_image:
+                meta = self.msg_metadata[self.cameras[i]]
+                if meta is not None:
+                    detection_image = cv2.cvtColor(detection_image, meta.get('inverse_conversion'))
+                detection_img_msg = self.bridge.cv2_to_imgmsg(
+                        detection_image, encoding=meta.get('msg_fmt'))
+                detection_img_msg.header = self.headers[self.cameras[i]]
+                self.publishers_[publisher_idx + 1].publish(detection_img_msg)
+
+                if mask_img is not None:
+                    mask_image_msg = self.bridge.cv2_to_imgmsg(mask_img, encoding="mono8")
+                    mask_image_msg.header = self.headers[self.cameras[i]]
+                    self.publishers_[publisher_idx + 3].publish(mask_image_msg)
+
+                    cv_image_inv = cv2.cvtColor(self.images[self.cameras[i]], meta.get('inverse_conversion'))
+                    color_mask_img = cv2.bitwise_and(cv_image_inv, cv_image_inv, mask=mask_img)
+                    color_mask_img_msg = self.bridge.cv2_to_imgmsg(
+                            color_mask_img, encoding=meta.get('msg_fmt'))
+                    color_mask_img_msg.header = self.headers[self.cameras[i]]
+                    self.publishers_[publisher_idx + 2].publish(color_mask_img_msg)
 
 
     def callback_common(self, msg, idx):
@@ -517,8 +556,8 @@ class MultiStreamDetector(Node):
             inverse_conversion = None
             is_color = True
             is_depth = False
-            cv_image, msg_encoding, image_frame_id, msg_timestamp, msg_fmt, conversion, inverse_conversion, is_color, is_depth, compressed_msg_codec = self.parse_image_message(
-                msg)
+            cv_image, msg_encoding, image_frame_id, msg_timestamp, msg_fmt, conversion, inverse_conversion, is_color, is_depth, compressed_msg_codec = parse_image_message(
+                msg, self.bridge, self.image_message_format, logger=self.get_logger())
 
             # get image dimensions
             if self.imgszs[self.cameras[idx]] is None:
@@ -527,11 +566,11 @@ class MultiStreamDetector(Node):
                     # Check divisibility by 32 to conform to YOLOs convolution kernel size and stride length
                     new_height = self.image_heights[self.cameras[idx]] if self.image_heights[self.cameras[idx]] % 32 == 0 else ((
                                                                                                     self.image_heights[self.cameras[idx]] // 32) + 1) * 32
-                    new_width = self.image_widths[self.cameras[idx]] if self.image_widths[self.cameras[idx]] % 32 == 0 else ((self.image_width // 32) + 1) * 32
+                    new_width = self.image_widths[self.cameras[idx]] if self.image_widths[self.cameras[idx]] % 32 == 0 else ((self.image_widths[self.cameras[idx]] // 32) + 1) * 32
 
-                    self.imgsz = (new_height, new_width)
+                    self.imgszs[self.cameras[idx]] = (new_height, new_width)
                 else:
-                    self.imgsz[self.cameras[idx]] = (640, 640)
+                    self.imgszs[self.cameras[idx]] = (640, 640)
 
             # (optional) resize the image
             if self.resize_image and self.use_image_dimensions and (
@@ -556,81 +595,16 @@ class MultiStreamDetector(Node):
             self.get_logger().error(f"Error processing image: {e}")
             raise e
 
-    def parse_image_message(self, msg):
-        image_frame_id = msg.header.frame_id
-        msg_timestamp = msg.header.stamp
-        msg_fmt = "bgr8"
-        compressed_msg_codec = None
-        conversion = None
-        inverse_conversion = None
-        is_color = True
-        is_depth = False
-        if self.image_message_format == "raw":
-            msg_encoding = msg.encoding
-
-        elif self.image_message_format == 'compressed':
-            # format: rgb8; jpeg compressed bgr8
-            msg_info = msg.format
-            msg_encoding_split = msg_info.split(';')
-            uncompressed_msg_fmt = msg_encoding_split[0]
-            compressed_img_info = msg_encoding_split[1].split()
-            compressed_msg_codec = compressed_img_info[0]
-            msg_encoding = compressed_img_info[-1]
-
-        # set the desired output encoding
-        # (http://wiki.ros.org/cv_bridge/Tutorials/UsingCvBridgeToConvertBetweenROSImagesAndOpenCVImages#cv_bridge.2FTutorials.2FUsingCvBridgeCppDiamondback.Converting_ROS_image_messages_to_OpenCV_images)
-        if (msg_encoding.find("mono8") != -1) or (msg_encoding.find("8UC1") != -1):
-            msg_fmt = "mono8"  # "8UC1"
-            is_color = False
-            conversion = cv2.COLOR_GRAY2BGR
-            inverse_conversion = cv2.COLOR_BGR2GRAY
-        elif msg_encoding.find("bgra") != -1:
-            msg_fmt = "bgra8"  # "8UC4"
-            conversion = cv2.COLOR_BGRA2BGR
-            inverse_conversion = cv2.COLOR_BGR2BGRA
-        elif msg_encoding.find("rgba") != -1:
-            msg_fmt = "rgba8"  # "8UC4"
-            conversion = cv2.COLOR_RGBA2BGR
-            inverse_conversion = cv2.COLOR_BGR2RGBA
-        elif msg_encoding.find("bgr8") != -1:
-            msg_fmt = "bgr8"  # or 8UC3
-            # conversion = cv2.COLOR_BGR2BGR
-            # inverse_conversion = cv2.COLOR_BGR2BGR
-        elif (msg_encoding.find("rgb8") != -1):
-            msg_fmt = "rgb8"  # or 8UC3
-            conversion = cv2.COLOR_RGB2BGR
-            inverse_conversion = cv2.COLOR_BGR2RGB
-        elif msg_encoding.find("16UC1") != -1:
-            msg_fmt = "16UC1"  # "16UC1", mono16
-            is_color = False
-            is_depth = True
-            # raise NotImplementedError("Depth images are not supported for YOLO detection")
-            #conversion = cv2.COLOR_GRAY2BGR
-            #inverse_conversion = cv2.COLOR_BGR2GRAY
-        else:
-            self.get_logger().error("Unsupported encoding:", msg_encoding)
-            self.exit(1)
-
-        # convert ROS2 image message to OpenCV
-        if self.image_message_format in ("compressed", "packet"):
-            cv_image = self.bridge.compressed_imgmsg_to_cv2(msg, msg_fmt)
-        else:
-            cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding=msg_fmt)
-
-        if conversion is not None:
-            cv_image = cv2.cvtColor(cv_image, conversion)
-        return (cv_image, msg_encoding, image_frame_id, msg_timestamp, msg_fmt, conversion, inverse_conversion,
-                is_color, is_depth, compressed_msg_codec)
-
     def detect_objects(self, image):
         try:
+            imgsz = next((v for v in self.imgszs.values() if v is not None), (640, 640))
             if self.track_2d:
                 # https://docs.ultralytics.com/modes/track/#why-choose-ultralytics-yolo-for-object-tracking
                 self.results = self.model.track(
                         source=image,
                         conf=self.conf_thresh,
                         iou=self.iou_thresh,
-                        imgsz=self.imgsz,
+                        imgsz=imgsz,
                         device=self.device,
                         half=self.half_precision,
                         classes=self.classes,
@@ -647,7 +621,7 @@ class MultiStreamDetector(Node):
                         source=image,
                         conf=self.conf_thresh,
                         iou=self.iou_thresh,
-                        imgsz=self.imgsz,
+                        imgsz=imgsz,
                         device=self.device,
                         half=self.half_precision,
                         classes=self.classes,

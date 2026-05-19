@@ -44,6 +44,7 @@ class TrackingNode(Node):
     def __init__(self):
         super(TrackingNode, self).__init__('tracking_node_2d')
         self.declare_parameter('tracker_2d', 'bytetrack.yaml')
+        self.declare_parameter('fps', 30)
         self.declare_parameter('queue_size', 10)
         self.declare_parameter('synchronization_interval', 0.1)
         self.declare_parameter('use_gpu', True)
@@ -57,6 +58,7 @@ class TrackingNode(Node):
         # Get parameters
         self.use_sim_time = self.get_parameter('use_sim_time').value
         self.tracker_2d = self.get_parameter('tracker_2d').value
+        self.fps = self.get_parameter('fps').value
         self.queue_size = self.get_parameter('queue_size').value
         self.synchronization_interval = self.get_parameter('synchronization_interval').value
         self.use_gpu = self.get_parameter('use_gpu').value
@@ -64,7 +66,7 @@ class TrackingNode(Node):
         self.qos = self.get_parameter('qos').value
 
         # Create the tracker
-        self.tracker = self.create_tracker(self.tracker_2d)
+        self.tracker = self.create_tracker(self.tracker_2d, fps=self.fps, use_gpu=self.use_gpu)
 
         # Initialize variables
         self.bridge = CvBridge()
@@ -135,9 +137,26 @@ class TrackingNode(Node):
 
                     tracked_box = Boxes(t[:-1], (img_msg.height, img_msg.width))
 
-                    # todo: switch to ObjectArray as using class_id for track ID isn't ideal especially for 3D
-                    # Example, see my fake obstacle publisher node: https://github.com/privvyledge/autodriver_fake_obstacle_publisher/blob/master/autodriver_fake_obstacle_publisher/fake_obstacle_publisher.py
-                    tracked_detection = detections_msg.detections[int(t[-1])]
+                    # IoU match: find the input detection whose box best overlaps this tracked box.
+                    # t[-1] is tracker-internal class index, NOT a detection list index.
+                    tracked_xyxy = tracked_box.xyxy[0].tolist()
+                    best_iou, best_idx = 0.0, 0
+                    for j, det_msg in enumerate(detections_msg.detections):
+                        cx, cy = det_msg.bbox.center.position.x, det_msg.bbox.center.position.y
+                        hw, hh = det_msg.bbox.size_x / 2, det_msg.bbox.size_y / 2
+                        det_xyxy = [cx - hw, cy - hh, cx + hw, cy + hh]
+                        xi1 = max(tracked_xyxy[0], det_xyxy[0])
+                        yi1 = max(tracked_xyxy[1], det_xyxy[1])
+                        xi2 = min(tracked_xyxy[2], det_xyxy[2])
+                        yi2 = min(tracked_xyxy[3], det_xyxy[3])
+                        inter = max(0.0, xi2 - xi1) * max(0.0, yi2 - yi1)
+                        area_t = (tracked_xyxy[2] - tracked_xyxy[0]) * (tracked_xyxy[3] - tracked_xyxy[1])
+                        area_d = det_msg.bbox.size_x * det_msg.bbox.size_y
+                        union = area_t + area_d - inter
+                        iou = inter / union if union > 0 else 0.0
+                        if iou > best_iou:
+                            best_iou, best_idx = iou, j
+                    tracked_detection = detections_msg.detections[best_idx]
 
                     # get boxes values
                     box = tracked_box.xywh[0]
@@ -159,7 +178,7 @@ class TrackingNode(Node):
         # publish detections
         self.tracked_detections_pub.publish(tracked_detections_msg)
 
-    def create_tracker(self, tracker_yaml: str) -> BaseTrack:
+    def create_tracker(self, tracker_yaml: str, fps: int = 30, use_gpu: bool = True) -> BaseTrack:
         TRACKER_MAP = {"bytetrack": BYTETracker, "botsort": BOTSORT}
         check_requirements("lap")  # for linear_assignment
 
@@ -169,8 +188,12 @@ class TrackingNode(Node):
         assert cfg.tracker_type in [
             "bytetrack",
             "botsort",
-        ], f"Only support 'bytetrack' and 'botsort' for now, but got '{cfg.tracker_type}'"
-        tracker = TRACKER_MAP[cfg.tracker_type](args=cfg, frame_rate=1)
+        ], f"Only 'bytetrack' and 'botsort' are supported for now, but got '{cfg.tracker_type}'"
+        if use_gpu and torch.cuda.is_available():
+            cfg.device = "0"
+        else:
+            cfg.device = "cpu"
+        tracker = TRACKER_MAP[cfg.tracker_type](args=cfg, frame_rate=fps)
         return tracker
 
 def main(args=None):

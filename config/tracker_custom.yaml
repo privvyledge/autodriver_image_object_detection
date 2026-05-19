@@ -1,0 +1,17 @@
+# Explanation: https://github.com/ultralytics/ultralytics/issues/4473
+tracker_type: bytetrack # tracker type, ['botsort', 'bytetrack']
+track_high_thresh: 0.25 # (0.25) threshold for the first association. Should be higher than object detection confidence score otherwise no tracks will be created.
+track_low_thresh: 0.1 # threshold for the second association. Should be lower than track_high_threshold
+new_track_thresh: 0.25 # threshold for init new track if the detection does not match any tracks. Used to create new tracks
+track_buffer: 60 # (30) buffer to calculate the time when to remove tracks.  Higher means more tolerance to occlusion. A good default is camera FPS
+match_thresh: 0.8 # threshold for matching tracks. Higher makes the matching more lenient.
+fuse_score: True # Whether to fuse confidence scores with the iou distances before matching
+# min_box_area: 10  # threshold for min box areas(for tracker evaluation, not used for now)
+
+# BoT-SORT settings
+gmc_method: sparseOptFlow # method of global motion compensation. [sparseOptFlow, orb, sift, ecc, None]
+# ReID model related thresh
+proximity_thresh: 0.5 # minimum IoU for valid match with ReID
+appearance_thresh: 0.8 # minimum appearance similarity for ReID
+with_reid: False  # more accurate but at the cost of performance
+model: auto # uses native features if detector is YOLO else yolo11n-cls.pt

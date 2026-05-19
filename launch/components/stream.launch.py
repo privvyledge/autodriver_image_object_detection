@@ -45,12 +45,13 @@ Todo:
     * add support for file saving (use my package instead) [done]
     * add support for mjpg (H264) encoding and print auto checking result [done]
     * setup file, camera camera and rtsp streaming [done]
-    * add support for saving raw image, yolo detection or both
-    * add support for disabling detection, gscam or both
+    * add support for saving raw image, yolo detection or both [done]
+    * add support for ros_deep_learning and jetson_inference for Jetsons (and maybe x86) since gscam doesn't support nvidia Jetsons gstreamer pipelines. [done]
     * add support for model name as an argument
+    * replace launch gstreamer config strings with ' ! '.join(list of stuff)
     * add support for automatic stream type inferencing e.g file, rtsp, camera from "stream_sources"
-    * add support for ros_deep_learning and jetson_inference for Jetsons (and maybe x86) since gscam doesn't support nvidia Jetsons gstreamer pipelines
     * move detection to a separate launch file and keep this streaming only
+    * add support for disabling detection, gscam or both. Do this by separating launch files.
     * cleanup the autoconfig string addition
     * add composition
 """
@@ -58,6 +59,8 @@ import os
 import subprocess
 import json
 import re
+import pathlib
+
 from launch import LaunchDescription, LaunchContext
 from launch_ros.actions import Node, SetRemap, PushRosNamespace, SetParametersFromFile, SetParameter
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression, EnvironmentVariable
@@ -156,6 +159,8 @@ def launch_setup(context, *args, **kwargs):
 
     # Get launch directories
     image_detection_launch_dir = os.path.join(image_detection_dir, 'launch')
+    image_detection_data_dir = os.path.join(image_detection_dir, 'data')
+    image_detection_config_dir = os.path.join(image_detection_dir, 'config')
 
     # Declare launch configuration variables
     use_sim_time = LaunchConfiguration('use_sim_time', default="False")
@@ -174,12 +179,14 @@ def launch_setup(context, *args, **kwargs):
     gscam_config = LaunchConfiguration('gscam_config', default='[""]')
     save_videos = LaunchConfiguration('save_videos', default="False")
     video_save_filenames = LaunchConfiguration('video_save_filenames', default='["video0.mp4"]')
-    video_save_source = LaunchConfiguration('video_save_source', default='raw')
+    video_save_source = LaunchConfiguration('video_save_source', default='raw')  # raw, detection, both
+    video_save_package = LaunchConfiguration('video_save_package', default='custom')  # custom (mine), jetson_inference
     loop = LaunchConfiguration('loop', default="True")
     sync_sink = LaunchConfiguration('sync_sink', default="True")
     use_gst_timestamps = LaunchConfiguration('use_gst_timestamps', default="True")
     use_sensor_data_qos = LaunchConfiguration('use_sensor_data_qos', default=False)
     image_encoding = LaunchConfiguration('image_encoding', default='rgb8')
+    stream_package = LaunchConfiguration('stream_package', default='jetson_inference')  # gscam, jetson_inference
 
     # use_composition = LaunchConfiguration('use_composition', default=False)
 
@@ -313,6 +320,12 @@ def launch_setup(context, *args, **kwargs):
             description='The image topic to use when saving videos. Options: raw, detection, both'
     )
 
+    declare_video_save_package_cmd = DeclareLaunchArgument(
+        'video_save_package',
+        default_value=video_save_package,
+        description='The package to use to save videos. Options: mine (supports static FPS), jetson_inference (better).'
+    )
+
     declare_loop_cmd = DeclareLaunchArgument(
             'loop',
             default_value=loop,
@@ -352,6 +365,18 @@ def launch_setup(context, *args, **kwargs):
                         '"jpeg" may be deprecated in future versions of this launch files.'
     )
 
+    declare_stream_package_cmd = DeclareLaunchArgument(
+        'stream_package',
+        default_value=stream_package,
+        description='The ROS package to use to open streams. Either "gscam" or "jetson_inference"'
+    )
+
+    declare_model_path_cmd = DeclareLaunchArgument(
+        'model_path',
+        default_value=os.path.join(image_detection_dir, 'yolo11x.engine'),
+        description='Path to the YOLO model file (.engine, .pt, .onnx) used by detection nodes'
+    )
+
     # declare_use_composition_cmd = DeclareLaunchArgument(
     #         'use_composition',
     #         default_value=use_composition,
@@ -376,11 +401,14 @@ def launch_setup(context, *args, **kwargs):
         declare_save_videos_cmd,
         declare_video_save_filenames_cmd,
         declare_video_save_source_cmd,
+        declare_video_save_package_cmd,
         declare_loop_cmd,
         declare_sync_sink_cmd,
         declare_use_gst_timestamps_cmd,
         declare_use_sensor_data_qos_cmd,
         declare_image_encoding_cmd,
+        declare_stream_package_cmd,
+        declare_model_path_cmd,
         # declare_use_composition_cmd,
     ]
 
@@ -400,11 +428,14 @@ def launch_setup(context, *args, **kwargs):
     gscam_config_list = parse_list_string(gscam_config.perform(context))
     save_videos_str = save_videos.perform(context)
     video_save_filenames_list = parse_list_string(video_save_filenames.perform(context))
+    video_save_source_str = str(video_save_source.perform(context))
+    video_save_package_str = video_save_package.perform(context)
     loop_str = loop.perform(context)
     sync_sink_str = sync_sink.perform(context)
     use_gst_timestamps_str = use_gst_timestamps.perform(context)
     use_sensor_data_qos_str = use_sensor_data_qos.perform(context)
     image_encoding_str = image_encoding.perform(context)
+    stream_package_str = stream_package.perform(context)
 
     # Ensure lists have the correct length
     assert len(frame_ids_list) == num_cameras_int, "frame_ids list length must match num_cameras"
@@ -416,12 +447,23 @@ def launch_setup(context, *args, **kwargs):
     assert len(gscam_config_list) == num_cameras_int, "gscam_config list length must match num_cameras"
     if save_videos_str.lower() == 'true':
         assert len(video_save_filenames_list) == num_cameras_int, "video_save_filenames list length must match num_cameras"
+    assert video_save_source_str in ['raw', 'detection', 'both']
+    assert video_save_package_str in ['custom', 'jetson_inference']
+
+    # To handle different detection models
+    model_path_str = LaunchConfiguration('model_path', default=os.path.join(image_detection_dir, 'yolo11x.engine')).perform(context)
+    model_paths = [model_path_str] * num_cameras_int
 
     # Generate gscam nodes
     nodes_to_launch = []
 
     multi_stream_remappings = []
     for i in range(num_cameras_int):
+        # Handle launch arguments
+        prepend_global_namespace = ''
+        if use_global_namespace_str.lower() == "true":
+            prepend_global_namespace = global_namespace_str.rstrip('/') + '/'
+
         # If the config is empty, use stream sources to choose
         if gscam_config_list[i] == "":
             input_codec = 'video/x-raw,'
@@ -433,7 +475,8 @@ def launch_setup(context, *args, **kwargs):
                 try:
                     # Query the device's supported formats.
                     output = subprocess.check_output(
-                            ["v4l2-ctl", "--list-formats-ext", "-d", stream_sources_list[i]]).decode("utf-8")
+                            ["v4l2-ctl", "--list-formats-ext", "-d", stream_sources_list[i]],
+                            timeout=5).decode("utf-8")
                     # If MJPG is found, use the MJPG pipeline.
                     if "MJPG" in output or "Motion-JPEG" in output:
                         input_codec = 'image/jpeg'
@@ -445,7 +488,7 @@ def launch_setup(context, *args, **kwargs):
                                 LogInfo(
                                         msg=f"Device {stream_sources_list[i]} does not support MJPG. "
                                             f"Using raw pipeline."))
-                except (subprocess.SubprocessError, subprocess.CalledProcessError) as e:
+                except (subprocess.SubprocessError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
                     # Log or print the error if needed and keep the default raw pipeline.
                     input_codec = 'video/x-raw'
                     nodes_to_launch.append(
@@ -479,9 +522,9 @@ def launch_setup(context, *args, **kwargs):
             if image_encoding_str == "jpeg":
                 # this block and image_encoding_str == "jpeg" is only used here to match the behaviour one of the GSCAM examples. Use the default image_encoding_str == "rgb8" for normal operation with streams_format="MJPG"
                 jpeg_config = ' ! jpegenc ! multipartmux ! multipartdemux ! jpegparse'
-                video_convert_str = '' if stream_sources_list[i] == "camera" else ' ! videoconvert' # only if the stream_source is a camera
+                video_convert_str = '' if stream_types_list[i] == "camera" else ' ! videoconvert' # only if the stream_source is a camera
                 mjpg_config = ''
-                input_codec = 'video/x-raw' if stream_sources_list[i] == "camera" else ' ! videoconvert'
+                input_codec = 'video/x-raw' if stream_types_list[i] == "camera" else ' ! videoconvert'
                 output_format_str = ''
 
             if stream_types_list[i] == "file":
@@ -497,11 +540,6 @@ def launch_setup(context, *args, **kwargs):
                 gscam_config_list[i] = (f"v4l2src {timestamp_config_string} device={stream_sources_list[i]} ! "
                                         f"{input_codec}{video_properties} "
                                         f"{jpeg_config}{mjpg_config}{video_convert_str}{output_format_str}")
-
-        # Handle launch arguments
-        prepend_global_namespace = ''
-        if use_global_namespace_str.lower() == "true":
-            prepend_global_namespace = global_namespace_str.rstrip('/') + '/'
 
         # if save_videos_str.lower() == "true":
         #     # since the GSCam package does not support output sinks, we will use my package ros_images_to_files
@@ -524,7 +562,11 @@ def launch_setup(context, *args, **kwargs):
             'use_sensor_data_qos': use_sensor_data_qos,
             'image_encoding': image_encoding
         }
+
         gscam_node = Node(
+                condition=IfCondition(PythonExpression([
+                    "'", stream_package, "' == 'gscam'"
+                ])),
                 package='gscam',
                 executable='gscam_node',
                 name='gscam_' + str(i),
@@ -545,40 +587,148 @@ def launch_setup(context, *args, **kwargs):
         )
         nodes_to_launch.append(gscam_node)
 
+        # Setup launching streams using jetson_inference package
+        if stream_package_str.lower() == 'jetson_inference':
+            try:
+                # search for the package and catch the exception if it does not exist
+                ros_deep_learning_package_share_dir = get_package_share_directory('ros_deep_learning')
+
+                input_resource = stream_sources_list[i]
+                if stream_types_list[i] == "file":
+                    if not stream_sources_list[i].startswith("file://"):
+                        input_resource = f"file://{stream_sources_list[i]}"
+                elif stream_types_list[i] == "rtsp":
+                    if not stream_sources_list[i].startswith("rtsp://"):
+                        input_resource = f"rtsp://{stream_sources_list[i]}"
+                elif stream_types_list[i] == "camera":
+                    if not stream_sources_list[i].startswith("v4l2://"):
+                        input_resource = f"v4l2://{stream_sources_list[i]}"  # v4l2 (optional), csi
+
+                jetson_inference_node = Node(
+                    # condition=IfCondition(PythonExpression([
+                    #     "'", stream_package, "' == 'jetson_inference'"
+                    # ])),
+                    package='ros_deep_learning',
+                    executable='video_source',
+                    name='jetson_inference_' + str(i),
+                    namespace=prepend_global_namespace + namespaces_list[i].strip().lstrip('/'),
+                    output='screen',
+                    parameters=[
+                        {
+                            'use_sim_time': use_sim_time,
+                            'resource': input_resource,
+                            'width': int(widths_list[i]),
+                            'height': int(heights_list[i]),
+                            'codec': "unknown",
+                            'loop': -1 if loop_str.lower() == 'true' else 0,
+                            'latency': 0,  # 2000
+                            'framerate': float(fps_list[i])
+                        }
+                    ],
+                    remappings=[
+                        ("raw", f"image_raw"),
+                    ],
+                    respawn=True,
+                    respawn_delay=2.0,
+                )
+                nodes_to_launch.append(jetson_inference_node)
+
+            except ROS2PackageNotFoundError as e:
+                error_msg = LogInfo(msg=f'Failed to launch ros_deep_learning: {e}.')
+                nodes_to_launch.append(error_msg)
+
         image_topic_is_compressed = False
         image_topic = 'image_raw'
         if image_encoding_str == "jpeg":
             image_topic_is_compressed = True
             image_topic += '/compressed'
 
+        detection_image_topic = 'yolo/detection_image'
         # Launch video recording via my ros_images_to_files package since gscam does not support output sinks
         if save_videos_str.lower() == "true":
-            video_record_topic = image_topic if video_save_source == "raw" else 'yolo/detection_image'
-            output_file_name = video_save_filenames_list[i]
-            try:
-                # search for the package and catch the exception if it does not exist
-                ros_images_to_file_spackage_share_dir = get_package_share_directory('ros_images_to_files')
-                video_recorder_node = Node(
-                        package='ros_images_to_files',
-                        executable='video_recorder_node',
-                        name='video_recorder_' + str(i),
-                        namespace=prepend_global_namespace + namespaces_list[i].strip().lstrip('/'),
-                        output='screen',
-                        parameters=[
-                            {'use_sim_time': use_sim_time},
-                            {'image_topic': video_record_topic},
-                            {'image_topic_is_compressed': image_topic_is_compressed},
-                            {'output_file_name': output_file_name},
-                            {'queue_size': 100},
-                            {'fps': float(fps_list[i]) if fps_list[i] > 0 else 30.0},
-                            {'qos': 'SENSOR_DATA' if use_sensor_data_qos_str.lower() == "true" else 'SYSTEM_DEFAULT'},
-                            {'show_image': False},
-                        ]
-                )
-                nodes_to_launch.append(video_recorder_node)
-            except ROS2PackageNotFoundError as e:
-                error_msg = LogInfo(msg=f'Failed to launch video_recorder_node: {e}. Skipping video recording.')
-                nodes_to_launch.append(error_msg)
+            valid_options = ('_raw', '_detection')
+            output_file_name_orig = video_save_filenames_list[i]
+            output_file_name_clean = output_file_name_orig.split('://')  # to remove file://, rtsp://, etc
+            output_file_path_obj = pathlib.Path(output_file_name_clean[-1])
+
+            video_record_topic = []
+            if video_save_source_str.lower() == "raw":
+                video_record_topic.append(image_topic)
+            elif video_save_source_str.lower() == "detection":
+                video_record_topic.append(detection_image_topic)
+            elif video_save_source_str.lower() == "both":
+                video_record_topic.extend([image_topic, detection_image_topic])
+
+            for vid_record_idx, vid_record_topic in enumerate(video_record_topic):
+                # modify the file name with more info
+                str_to_append = ''
+                if video_save_source_str.lower() == "raw":
+                    # str_to_append = valid_options[0] if len(video_record_topic) > 1 else ''
+                    pass
+                elif video_save_source_str.lower() == "detection":
+                    # str_to_append = valid_options[1] if len(video_record_topic) > 1 else ''
+                    pass
+                elif video_save_source_str.lower() == "both":
+                    str_to_append = valid_options[vid_record_idx]
+                output_file_name = str(output_file_path_obj.with_stem(f"{output_file_path_obj.stem}{str_to_append}"))
+                output_file_name = output_file_name if len(output_file_name_clean) == 1 else f'{output_file_name_clean[0]}://{output_file_name}'
+
+                if video_save_package_str.lower() == 'custom':
+                    try:
+                        # search for the package and catch the exception if it does not exist
+                        ros_images_to_files_package_share_dir = get_package_share_directory('ros_images_to_files')
+                        custom_video_recorder_node = Node(
+                                package='ros_images_to_files',
+                                executable='video_recorder_node',
+                                name=f'custom_video_recorder_cam{i}{valid_options[vid_record_idx]}',
+                                namespace=prepend_global_namespace + namespaces_list[i].strip().lstrip('/'),
+                                output='screen',
+                                parameters=[
+                                    {'use_sim_time': use_sim_time},
+                                    {'image_topic': vid_record_topic},
+                                    {'image_topic_is_compressed': image_topic_is_compressed},
+                                    {'output_file_name': output_file_name.split('://')[-1]},
+                                    {'queue_size': 100},
+                                    {'fps': float(fps_list[i]) if fps_list[i] > 0 else 30.0},
+                                    {'qos': 'SENSOR_DATA' if use_sensor_data_qos_str.lower() == "true" else 'SYSTEM_DEFAULT'},
+                                    {'show_image': False},
+                                ]
+                        )
+                        nodes_to_launch.append(custom_video_recorder_node)
+                    except ROS2PackageNotFoundError as e:
+                        error_msg = LogInfo(msg=f'Failed to launch custom_video_recorder_node: {e}. Skipping video recording.')
+                        nodes_to_launch.append(error_msg)
+
+                elif video_save_package_str.lower() == 'jetson_inference':
+                    try:
+                        # search for the package and catch the exception if it does not exist
+                        ros_deep_learning_package_share_dir = get_package_share_directory('ros_deep_learning')
+                        # if not output_file_name.startswith(("file://", "rtsp://")):
+                        #     outpuoutput_file_namet_resource = f"file://{output_file_name[i]}"
+
+                        jetson_inference_video_recorder_node = Node(
+                            package='ros_deep_learning',
+                            executable='video_output',
+                            name=f'jetson_inference_video_recorder_cam{i}{valid_options[vid_record_idx]}',
+                            namespace=prepend_global_namespace + namespaces_list[i].strip().lstrip('/'),
+                            output='screen',
+                            parameters=[
+                                {
+                                    'use_sim_time': use_sim_time,
+                                    'resource': output_file_name,
+                                    'codec': 'unknown',
+                                    'bitrate': 0
+                                },
+
+                            ],
+                            remappings=[
+                                ("image_in", vid_record_topic),
+                            ],
+                        )
+                        nodes_to_launch.append(jetson_inference_video_recorder_node)
+                    except ROS2PackageNotFoundError as e:
+                        error_msg = LogInfo(msg=f'Failed to launch ros_deep_learning: {e}.')
+                        nodes_to_launch.append(error_msg)
 
         # Generate autodriver_image_object_detection nodes
         yolo_node = Node(
@@ -595,15 +745,36 @@ def launch_setup(context, *args, **kwargs):
                     'input_image_topic_is_compressed': image_topic_is_compressed,
                     'detection_results_topic': 'yolo/detection_results',
                     'publish_debug_image': True,
-                    'detection_image_topic': 'yolo/detection_image',
+                    'detection_image_topic': detection_image_topic,
                     'segmentation_image_topic': 'yolo/segmentation_image',
                     'segmentation_mask_image_topic': 'yolo/segmentation_mask_image',
                     'qos': 'SENSOR_DATA' if use_sensor_data_qos_str.lower() == "true" else 'SYSTEM_DEFAULT',
-                    'model_path': "yolo11x-seg.engine",  # rtdetr-l.pt, yolo11m-seg.engine
+                    # yolo11x.engine, yolo12x.engine, rtdetr-x.pt, yolov9e.engine, yolo11m-seg.engine, yolov10x.engine, yolov8x.engine
+                    'model_path': model_paths[i],
                     'export_model_format': '',
-                    'use_image_dimensions': True,
+                    'use_image_dimensions': False,  # True (slower but works with dynamic exports), False (faster with fixed size/batch exports)
+                    'image_dimensions': [640, 640],  # [480, 640]
+                    'resize_image': False,  # False
                     'use_gpu': True,
                     'show_image': False,
+                    'conf_thresh': 0.55,  # 0.55
+                    'iou_thresh': 0.55,
+                    'max_det': 100,
+                    'augment': False,
+                    'queue_size': 1,
+                    'tracker_2d.path': os.path.join(image_detection_config_dir, 'tracker_custom.yaml'),
+                    'tracker_2d.tracker_type': 'bytetrack',  # bytetrack
+                    'tracker_2d.track_high_thresh': 0.45,  # -1.0
+                    'tracker_2d.track_low_thresh': -1.0,
+                    'tracker_2d.new_track_thresh': -0.5,  # -1.0
+                    'tracker_2d.track_buffer': -1,
+                    'tracker_2d.match_thresh': 0.95,  # -1.0
+                    'tracker_2d.fuse_score': True,
+                    'tracker_2d.gmc_method': '',
+                    'tracker_2d.proximity_thresh': -1.0,
+                    'tracker_2d.appearance_thresh': -1.0,
+                    'tracker_2d.with_reid': False,  # False
+                    'tracker_2d.model': 'auto',
                 }
             ]
         )
@@ -655,6 +826,16 @@ def launch_setup(context, *args, **kwargs):
             remappings=multi_stream_remappings
     )
     #nodes_to_launch.append(multi_yolo_node)
+
+    # RViz node
+    rviz_node = Node(
+                package='rviz2',
+                executable='rviz2',
+                name='rviz2',
+                # arguments=['-d', 'detection.rviz'],
+                output='screen'
+            )
+    nodes_to_launch.append(rviz_node)
 
     # return the launch description
     camera_group = GroupAction(

@@ -13,6 +13,7 @@ Usage:
 4. Implement projection to 3D [done]
 
 Todo:
+    * refactor this node so it can work with/without depth/pointcloud, i.e cleanly separate image stuff, depth and pointcloud
     * Implement non-tracking (i.e predict) [done]
     * Setup segmentation (https://docs.ultralytics.com/reference/engine/results/#ultralytics.engine.results.Masks | )
         * show segmentation mask image [done]
@@ -26,34 +27,81 @@ Todo:
     * add check for .engine model with try-catch and then convert to tensorrt [done]
     * switch to engine models as the default [done]
     * add ability to run multiple models simultaneously, e.g segmentation and obb [done: just run another instance of this node for separation of concern reasons]
+    * use TimeSynchronizer if synchronization_interval == 0.0 or if approx_sync parameter is False [done]
+    * setup limiting detected classes [done]
+    * plot 2D tracks over time [done]
+    * export models to engine
+    * publish the axes (/tf of detected objects)
 
-    * use the following example for 2D detection projection to 3D (https://github.com/tony23545/nav2_dynamic_obstacle/blob/master/detectron2_detector/detectron2_detector/detectron2_node.py)
-    * add support for batch inference (multiple cameras/images at once)
-    * use TimeSynchronizer if synchronization_interval == 0.0 or if approx_sync parameter is False
-    * filter out objects/clusters with min_height above a certain threshold
     * add a parameter to choose what timestamp should be put in the message (current time or message timestamp)
+    * Publish clusters/pointclouds
+    * Fix projection accuracy and compare, e.g with Carla
+        * use the following example for 2D detection projection to 3D (https://github.com/tony23545/nav2_dynamic_obstacle/blob/master/detectron2_detector/detectron2_detector/detectron2_node.py)
+        * copy my new torch reprojections
+        * Ask GPTs
+    * Setup OBB (https://docs.ultralytics.com/reference/engine/results/#ultralytics.engine.results.OBB)
+    * add support for batch inference (multiple cameras/images at once)
+    * filter out objects/clusters with min_height above a certain threshold
     * publish as a derived_object
+
+    * Cleanup
     * rename rgb to camera_0
     * rename images to frame (to accomodate pointcloud)
-    * setup limiting detected classes
     * publish detection pointcloud for debugging
-    * plot tracks over time
-    * Setup OBB (https://docs.ultralytics.com/reference/engine/results/#ultralytics.engine.results.OBB)
-    * publish the axes (/tf of detected objects)
     * switch to image transport for more modularity and better compressed image support use try-catch to handle image transport not being installed (https://github.com/ros-perception/image_transport_tutorials?tab=readme-ov-file#py_simple_image_pub)
-"""
 
+Bugs:
+    * Depth:
+        * 3D bounding box from depth too long, probable caused by far away objects intersecting with the 2D bounding box
+        * 3D bounding box dimensions not right. Needs fixing
+"""
+import os
+import sys
 import time
-import uuid
 import struct
+import tempfile
 from collections import defaultdict
+
+import yaml
+import numpy as np
+try:
+    import scipy
+    from scipy.spatial.transform import Rotation as R
+    SCIPY_INSTALLED = True
+    SCIPY_VERSION = scipy.__version__
+except ImportError:
+    SCIPY_INSTALLED = False
+    SCIPY_VERSION = '0.0.0'
+
+try:
+    import tf_transformations
+    from tf_transformations import quaternion_matrix, quaternion_from_matrix
+    TF_TRANSFORMATIONS_INSTALLED = True
+except ImportError:
+    TF_TRANSFORMATIONS_INSTALLED = False
+
+import cv2
+import torch
+import torch.utils.dlpack
+import ultralytics
+
+try:
+    import open3d as o3d
+    import open3d.core as o3c
+    OPEN3D_AVAILABLE = True
+except ImportError:
+    OPEN3D_AVAILABLE = False
+
+from cv_bridge import CvBridge
 import rclpy
 from rclpy.node import Node
+from ament_index_python.packages import get_package_share_directory
 from rclpy.parameter import Parameter
 from rclpy import qos
 from rclpy.time import Time
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-from rcl_interfaces.msg import ParameterDescriptor, ParameterType
+from rclpy.executors import ExternalShutdownException
+from rcl_interfaces.msg import ParameterDescriptor, ParameterType, SetParametersResult
 from std_msgs.msg import Header, ColorRGBA
 from sensor_msgs.msg import Image, CompressedImage, CameraInfo, Imu, PointCloud2, PointField
 from vision_msgs.msg import Detection2D, Detection2DArray, Detection3D, Detection3DArray, ObjectHypothesisWithPose
@@ -74,161 +122,78 @@ except ImportError:
 import tf2_ros
 from tf2_ros import TransformBroadcaster, TransformListener, Buffer, LookupException, ConnectivityException, \
     ExtrapolationException
-import tf_transformations
-import numpy as np
-import transforms3d
-from tf_transformations import quaternion_matrix, quaternion_from_matrix
 
-from cv_bridge import CvBridge
-import cv2
-import torch
-import torch.utils.dlpack
-import ultralytics
+from autodriver_image_object_detection.utils.common import pack_2d_detection, pack_nav2_obstacle_msg, pack_derived_object_msg, update_tracker_param
+from autodriver_image_object_detection.utils.imaging_utils import parse_image_message as _parse_image_message
 
-try:
-    import open3d as o3d
-    import open3d.core as o3c
-except ImportError:
-    pass
+if OPEN3D_AVAILABLE:
+    from autodriver_pointcloud_preprocessor.pointcloud_preprocessor import PointcloudPreprocessorNode
 
 
-def pack_2d_detection(x, y, size_x, size_y, class_id, conf, id):
-    detection = Detection2D()
-    detection.bbox.center.position.x = float(x)
-    detection.bbox.center.position.y = float(y)
-    detection.bbox.size_x = float(size_x)
-    detection.bbox.size_y = float(size_y)
-    detection.id = str(id)
-    hypothesis = ObjectHypothesisWithPose()
-    hypothesis.hypothesis.class_id = class_id
-    hypothesis.hypothesis.score = float(conf)
-    detection.results.append(hypothesis)
-    return detection
+    # from autodriver_pointcloud_preprocessor.utils import (convert_pointcloud_to_numpy, numpy_struct_to_pointcloud2,
+    #                                                       get_current_time, get_time_difference,
+    #                                                       dict_to_open3d_tensor_pointcloud,
+    #                                                       pointcloud_to_dict, get_pointcloud_metadata,
+    #                                                       check_field, crop_pointcloud,
+    #                                                       extract_rgb_from_pointcloud, get_fields_from_dicts,
+    #                                                       remove_duplicates, rgb_float_to_bytes,
+    #                                                       FIELD_DTYPE_MAP, FIELD_DTYPE_MAP_INV)
 
-
-def pack_nav2_obstacle_msg(x, y, size_x, size_y, class_id, conf, id=None):
-    if id in (None, -1):
-        uuid_ = uuid.uuid4()
-    else:
-        uuid_ = uuid.UUID(int=id)
-        # or
-        #id_str = str(id)
-        #uuid_ = uuid.uuid5(uuid.NAMESPACE_DNS, id_str)
-
-    obstacle_msg = Obstacle()
-    obstacle_msg.uuid.uuid = list(uuid_.bytes)
-    obstacle_msg.score = float(conf)
-    obstacle_msg.position.x = float(x)
-    obstacle_msg.position.y = float(y)
-    obstacle_msg.size.x = float(size_x)
-    obstacle_msg.size.y = float(size_y)
-    return obstacle_msg
-
-def pack_derived_object_msg(x, y, size_x, size_y, class_id, conf, id=None):
-    """Convert a nav2_dynamic_msgs/Obstacle into a derived_object_msgs/Object."""
-    obj = Object()
-    # Convert first 4 bytes of the obstacle's UUID into a uint32 id.
-    if id in (None, -1):
-        id = 10000000
-    obj.id = id
-
-    # Set detection level. Here we assume that an obstacle from tracking
-    # is equivalent to a TRACKED object.
-    obj.detection_level = Object.OBJECT_TRACKED
-
-    # Set pose. Use the obstacle's position and set a default orientation.
-    obj.pose.position = Point(x=float(x), y=float(y), z=0.0)
-    obj.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
-
-    # Set twist using the obstacle's velocity; angular part is set to zero.
-    obj.twist.linear = Vector3(x=0.0, y=0.0, z=0.0)
-    obj.twist.angular = Vector3(x=0.0, y=0.0, z=0.0)
-
-    # Set acceleration to zero (no info available).
-    obj.accel.linear = Vector3(x=0.0, y=0.0, z=0.0)
-    obj.accel.angular = Vector3(x=0.0, y=0.0, z=0.0)
-
-    # Leave polygon empty.
-    # Convert obstacle size into a SolidPrimitive shape (assuming a box).
-    sp = SolidPrimitive()
-    sp.type = SolidPrimitive.BOX
-    sp.dimensions = [float(size_x), float(size_y), 0.0]
-    obj.shape = sp
-
-    # Set classification fields to defaults.
-    obj.classification = {
-        'car': Object.CLASSIFICATION_CAR,
-        'truck': Object.CLASSIFICATION_TRUCK,
-        'bus': Object.CLASSIFICATION_OTHER_VEHICLE,
-        'person': Object.CLASSIFICATION_PEDESTRIAN,
-        'motorcycle': Object.CLASSIFICATION_MOTORCYCLE,
-        'bicycle': Object.CLASSIFICATION_BIKE,
-        'train': Object.CLASSIFICATION_OTHER_VEHICLE,
-        'airplane': Object.CLASSIFICATION_UNKNOWN_BIG,
-        'boat': Object.CLASSIFICATION_UNKNOWN_MEDIUM,
-    }.get(class_id, Object.CLASSIFICATION_UNKNOWN)  # Object.CLASSIFICATION_UNKNOWN_SMALL
-
-    # Mark the object as classified if the detection score is high.
-    obj.object_classified = bool(conf > 0.25)  # same as conf_threshold
-
-    # Convert the obstacle score (0-1) to a certainty value (0-255)
-    obj.classification_certainty = int(conf * 255)
-    obj.classification_age = 0
-
-    return obj
 
 class ImageObstacleDetectionNode(Node):
     def __init__(self):
+        this_package_dir = get_package_share_directory('autodriver_image_object_detection')
         super(ImageObstacleDetectionNode, self).__init__("image_obstacle_detection_node")
 
         # Declare parameters
-        self.declare_parameter(name='input_image_topic', value="/camera/camera/color/image_raw",
+        self.declare_parameter(name='input_image_topic', value="carla/ego_vehicle/rgb_front/image",  # "camera/image_raw", camera/color/image_raw, carla/ego_vehicle/rgb_front/image
                                descriptor=ParameterDescriptor(
-                                       description='The input image topic. '
-                                                   'Works with all image types: RGB(A), BGR(A), mono8, mono16.',
-                                       type=ParameterType.PARAMETER_STRING))
-        self.declare_parameter(name='input_camera_info_topic', value="/camera/camera/color/camera_info",
+                                   description='The input image topic. '
+                                               'Works with all image types: RGB(A), BGR(A), mono8, mono16.',
+                                   type=ParameterType.PARAMETER_STRING))
+        self.declare_parameter(name='input_camera_info_topic', value="carla/ego_vehicle/rgb_front/camera_info",  # camera/color/camera_info, carla/ego_vehicle/rgb_front/camera_info
                                descriptor=ParameterDescriptor(
                                        description='',
                                        type=ParameterType.PARAMETER_STRING))
         self.declare_parameter(name='input_image_topic_is_compressed', value=False, descriptor=ParameterDescriptor(
                 description='',
                 type=ParameterType.PARAMETER_BOOL))
-        self.declare_parameter(name='detection_results_topic', value="/yolo/detection_results",
+        self.declare_parameter(name='detection_results_topic', value="yolo/detection_results",
                                descriptor=ParameterDescriptor(
                                        description='',
                                        type=ParameterType.PARAMETER_STRING))
         self.declare_parameter('publish_debug_image', True)
-        self.declare_parameter(name='detection_image_topic', value="/yolo/detection_image",
+        self.declare_parameter(name='detection_image_topic', value="yolo/detection_image",
                                descriptor=ParameterDescriptor(
                                        description='',
                                        type=ParameterType.PARAMETER_STRING))
-        self.declare_parameter(name='segmentation_image_topic', value="/yolo/segmentation_image",
+        self.declare_parameter(name='segmentation_image_topic', value="yolo/segmentation_image",
                                descriptor=ParameterDescriptor(
                                        description='',
                                        type=ParameterType.PARAMETER_STRING))
-        self.declare_parameter(name='segmentation_mask_image_topic', value="/yolo/segmentation_mask_image",
+        self.declare_parameter(name='segmentation_mask_image_topic', value="yolo/segmentation_mask_image",
                                descriptor=ParameterDescriptor(
-                                       description='',
-                                       type=ParameterType.PARAMETER_STRING))
-        self.declare_parameter(name='depth_image_topic', value="/camera/camera/aligned_depth_to_color/image_raw",
+                                   description='',
+                                   type=ParameterType.PARAMETER_STRING))
+        self.declare_parameter(name='depth_image_topic', value="carla/ego_vehicle/depth_front/image",
+                               # "depth/image_raw", camera/aligned_depth_to_color/image_raw, carla/ego_vehicle/depth_front/image
                                descriptor=ParameterDescriptor(
                                        description='',
                                        type=ParameterType.PARAMETER_STRING))
         self.declare_parameter(name='depth_camera_info_topic',
-                               value="/camera/camera/aligned_depth_to_color/camera_info",
+                               value="carla/ego_vehicle/depth_front/camera_info",  # "depth/camera_info", carla/ego_vehicle/depth_front/camera_info
                                descriptor=ParameterDescriptor(
                                        description='',
                                        type=ParameterType.PARAMETER_STRING))
         self.declare_parameter(name='pointcloud_topic',
-                               value="/camera/camera/depth/color/points",
+                               value="carla/ego_vehicle/lidar",  # camera/depth/color/points, carla/ego_vehicle/lidar
                                descriptor=ParameterDescriptor(
                                        description='',
                                        type=ParameterType.PARAMETER_STRING))
         self.declare_parameter(name='qos', value="SENSOR_DATA", descriptor=ParameterDescriptor(
-                description='',
-                type=ParameterType.PARAMETER_STRING))
-        self.declare_parameter(name='model_path', value="yolov8m-seg.engine",
+            description='',
+            type=ParameterType.PARAMETER_STRING))
+        self.declare_parameter(name='model_path', value="yolo11x-seg.pt",  # yolo11n-seg.pt, yolo11x-seg.pt, yolo11x.pt
                                descriptor=ParameterDescriptor(
                                        description='',
                                        type=ParameterType.PARAMETER_STRING))
@@ -240,40 +205,62 @@ class ImageObstacleDetectionNode(Node):
                                                    'for supported formats.',
                                type=ParameterType.PARAMETER_BOOL))
         self.declare_parameter('track_2d', True)
-        self.declare_parameter('track_3d', True)  # todo: implement 3D tracking
-        self.declare_parameter('tracker_2d', 'bytetrack.yaml')
+        self.declare_parameter('tracker_2d.path', os.path.join(this_package_dir, 'config', 'tracker_custom.yaml'))
+        self.declare_parameter('tracker_2d.tracker_type', 'bytetrack')
+        self.declare_parameter('tracker_2d.track_high_thresh', -1.0)
+        self.declare_parameter('tracker_2d.track_low_thresh', -1.0)
+        self.declare_parameter('tracker_2d.new_track_thresh', -1.0)
+        self.declare_parameter('tracker_2d.track_buffer', -1)
+        self.declare_parameter('tracker_2d.match_thresh', -1.0)
+        self.declare_parameter('tracker_2d.fuse_score', True)
+        self.declare_parameter('tracker_2d.gmc_method', '')
+        self.declare_parameter('tracker_2d.proximity_thresh', -1.0)
+        self.declare_parameter('tracker_2d.appearance_thresh', -1.0)
+        self.declare_parameter('tracker_2d.with_reid', True)
+        self.declare_parameter('tracker_2d.model', 'auto')
         self.declare_parameter('plot_tracks', True)
         self.declare_parameter('queue_size', 1)
+        self.declare_parameter('track_3d', True)  # todo: implement 3D tracking
         self.declare_parameter('synchronization_interval', 0.1)
         self.declare_parameter('use_gpu', True)
         self.declare_parameter(name='show_image', value=False, descriptor=ParameterDescriptor(
                 description='',
                 type=ParameterType.PARAMETER_BOOL))
         self.declare_parameter(name="use_image_dimensions", value=True, descriptor=ParameterDescriptor(
-                description='Whether to use the image dimensions when running inference or using a fixed square image '
-                            'size for the model. Setting to True typically yields better performance.',
-                type=ParameterType.PARAMETER_BOOL))
-        self.declare_parameter(name="image_dimensions", value=(480, 640), descriptor=ParameterDescriptor(
-                description='The image dimensions to use when running inference. '
-                            'Must be set if exporting the model to another format, '
-                            'e.g TensorRT .engine since that is compiled with a fixed size.',
-                type=ParameterType.PARAMETER_INTEGER_ARRAY
-        ))  # todo: set imgsz as this parameter
+            description='Whether to use the image dimensions when running inference or using a fixed square image '
+                        'size for the model. '
+                        'Setting to True typically yields better performance when running models exported with '
+                        'dynamic shapes but is generally slower with False. '
+                        'False: faster with fixed size/batch exports.',
+            type=ParameterType.PARAMETER_BOOL))
+        self.declare_parameter(name="image_dimensions", value=[640, 640], descriptor=ParameterDescriptor(
+            description='The image dimensions to use when running inference. '
+                        'Must be set if exporting the model to another format, '
+                        'e.g TensorRT .engine since that is compiled with a fixed size. '
+                        'Examples: [480, 640], [1080, 1920]. Default: [640, 640].',
+            type=ParameterType.PARAMETER_INTEGER_ARRAY
+        ))
         self.declare_parameter("resize_image", False)
         self.declare_parameter("half_precision", True)
-        self.declare_parameter("conf_thresh", 0.25)
-        self.declare_parameter("iou_thresh", 0.45)
-        self.declare_parameter("max_det", 300)
-        self.declare_parameter("classes", ['person', 'car'])  # [] or ['person', 'car'] or [0, 2]
-        self.declare_parameter("project_to_3d", True)  # todo: remove this flag and just use depth or pointcloud
-        self.declare_parameter("use_depth", True)  # can run both at the same time at the cost of speed. Depth is significantly faster for now (about 2.5 times)
-        self.declare_parameter("use_pointcloud", False)  # can run both at the same time at the cost of speed. Depth is significantly faster for now (about 2.5 times)
-        self.declare_parameter("output_frame", "base_link")  # e.g base_link.
-        self.declare_parameter('static_camera_to_robot_tf', True)
-        self.declare_parameter("transform_timeout", 0.1)
+        self.declare_parameter("conf_thresh", 0.55)
+        self.declare_parameter("iou_thresh", 0.55)
+        self.declare_parameter("max_det", 50)
+        self.declare_parameter("classes", ['person', 'car', 'chair'])  # [] or ['person', 'car'] or [0, 2]
+        self.declare_parameter("update_class", "")  # type "class_name" to add or "-class_name" to delete
+        self.declare_parameter("agnostic_nms", True)
+        self.declare_parameter("augment", False)
+        self.declare_parameter("verbose", False)
         self.declare_parameter('static_camera_info', True)
-        self.declare_parameter('depth_scale', 1000.0)  # mm to meters
-        self.declare_parameter('depth_max', 4.0)  # meters
+        self.declare_parameter("transform_timeout", 2.0)  # 0.1
+        self.declare_parameter("project_to_3d", True)  # todo: remove this flag and just use depth or pointcloud
+        self.declare_parameter("use_depth",
+                               True)  # can run both at the same time at the cost of speed. Depth is significantly faster for now (about 2.5 times)
+        self.declare_parameter("use_pointcloud",
+                               True)  # can run both at the same time at the cost of speed. Depth is significantly faster for now (about 2.5 times)
+        self.declare_parameter("output_frame", "ego_vehicle")  # e.g base_link, ego_vehicle (carla)
+        self.declare_parameter('static_camera_to_robot_tf', True)
+        self.declare_parameter('depth_scale', 1.0)  # mm to meters. 1.0 for Carla (32FC1), 1000.0 for Realsense (16UC1)
+        self.declare_parameter('depth_max', 50.0)  # meters. 1000. for Carla, 6.0 for Realsense
         self.declare_parameter(name='normalize_depth', value=False, descriptor=ParameterDescriptor(
                 description='',
                 type=ParameterType.PARAMETER_BOOL))
@@ -281,15 +268,18 @@ class ImageObstacleDetectionNode(Node):
                 description='',
                 type=ParameterType.PARAMETER_DOUBLE))
 
-        self.declare_parameter('crop_to_roi', True)
-        self.declare_parameter('roi_min', [-6.0, -6.0, 0.0])
-        self.declare_parameter('roi_max', [6.0, 6.0, 2.0])
+        self.declare_parameter('crop_to_roi', False)
+        self.declare_parameter('roi_min', [-60.0, -60.0, -20.0])  # [-6.0, -6.0, 0.0]
+        self.declare_parameter('roi_max', [60.0, 60.0, 20.0])  # [6.0, 6.0, 2.0]
         self.declare_parameter('voxel_size', 0.05)  # 0.01, 0.05
         self.declare_parameter('remove_statistical_outliers', False)
         self.declare_parameter('estimate_normals', False)
         self.declare_parameter('remove_ground', False)
-        self.declare_parameter("cluster_tolerance", 0.2)  # meters
-        self.declare_parameter("min_cluster_size", 100)
+        self.declare_parameter("cluster_tolerance", 1.0)  # meters. 0.2. Carla 1.0
+        self.declare_parameter("min_cluster_size", 5)  # 100. Carla (5)
+        self.declare_parameter("max_cluster_size", 1000)  # values <= 0 means no limit
+        self.declare_parameter('cluster_min_height', 0.1)  # min height of cluster
+        self.declare_parameter('cluster_max_height', 2.0)  # max height of cluster
         self.declare_parameter("bounding_box_type", "AABB")  # AABB or OBB
 
         # Get parameters
@@ -308,11 +298,12 @@ class ImageObstacleDetectionNode(Node):
         self.qos = self.get_parameter('qos').value
         self.model_path = self.get_parameter('model_path').value
         self.export_model_format = self.get_parameter('export_model_format').get_parameter_value().string_value
-        self.track_2d = self.get_parameter('track_2d').value
-        self.track_3d = self.get_parameter('track_3d').value
-        self.tracker_2d = self.get_parameter('tracker_2d').value
+        self.track_2d = self.get_parameter('track_2d').get_parameter_value().bool_value
+        self.tracker_2d_cfg = self.get_parameters_by_prefix('tracker_2d')
+        self.tracker_2d_cfg = {k: v.value for k, v in self.tracker_2d_cfg.items()}
         self.plot_tracks = self.get_parameter('plot_tracks').value
         self.queue_size = self.get_parameter('queue_size').value
+        self.track_3d = self.get_parameter('track_3d').value
         self.synchronization_interval = self.get_parameter('synchronization_interval').value
         self.use_gpu = self.get_parameter('use_gpu').value
         self.show_image = self.get_parameter('show_image').get_parameter_value().bool_value
@@ -326,6 +317,10 @@ class ImageObstacleDetectionNode(Node):
         self.classes = (
             self.get_parameter("classes").value
         )
+        self.update_class = self.get_parameter("update_class").value
+        self.agnostic_nms = self.get_parameter("agnostic_nms").get_parameter_value().bool_value
+        self.augment = self.get_parameter("augment").get_parameter_value().bool_value
+        self.verbose = self.get_parameter("verbose").get_parameter_value().bool_value
         self.project_to_3d = self.get_parameter("project_to_3d").get_parameter_value().bool_value
         self.use_depth = self.get_parameter("use_depth").get_parameter_value().bool_value
         self.use_pointcloud = self.get_parameter("use_pointcloud").get_parameter_value().bool_value
@@ -338,6 +333,8 @@ class ImageObstacleDetectionNode(Node):
         self.depth_max = self.get_parameter("depth_max").get_parameter_value().double_value
         self.normalize_depth = self.get_parameter("normalize_depth").get_parameter_value().bool_value
         self.normalized_max = self.get_parameter("normalized_max").get_parameter_value().double_value
+
+        # todo: use pointcloud preprocessing class
         self.crop_to_roi = self.get_parameter('crop_to_roi').value
         self.roi_min = self.get_parameter('roi_min').value
         self.roi_max = self.get_parameter('roi_max').value
@@ -347,20 +344,31 @@ class ImageObstacleDetectionNode(Node):
         self.remove_ground = self.get_parameter('remove_ground').value
         self.cluster_tolerance = self.get_parameter("cluster_tolerance").get_parameter_value().double_value
         self.min_cluster_size = self.get_parameter("min_cluster_size").get_parameter_value().integer_value
+        self.max_cluster_size = self.get_parameter("max_cluster_size").get_parameter_value().integer_value
+        self.cluster_min_height = self.get_parameter('cluster_min_height').value
+        self.cluster_max_height = self.get_parameter('cluster_max_height').value
         self.bounding_box_type = self.get_parameter("bounding_box_type").value
+
+        os.environ['YOLO_VERBOSE'] = str(self.verbose)
+
+        if not OPEN3D_AVAILABLE:
+            self.get_logger().warn("Open3D not installed. PointCloud use is disabled.")
+            self.use_pointcloud = False
 
         # Setup the device
         self.device = 'cpu'
         self.torch_device = torch.device('cpu')
-        if self.project_to_3d:
+        if self.project_to_3d and self.use_pointcloud:
             self.o3d_device = o3d.core.Device('CPU:0')
+
         if self.use_gpu:
             if torch.cuda.is_available():
                 self.device = 'cuda:0'
                 self.torch_device = torch.device('cuda:0')
-                if self.project_to_3d:
-                    if o3d.core.cuda.is_available():
-                        self.o3d_device = o3d.core.Device('CUDA:0')
+            if self.project_to_3d and self.use_pointcloud:
+                # todo: add separate flag for Open3D
+                if o3d.core.cuda.is_available():
+                    self.o3d_device = o3d.core.Device('CUDA:0')
 
         # Initialize variables
         self.image_frame_id = None
@@ -400,14 +408,14 @@ class ImageObstacleDetectionNode(Node):
                     # task=self.task,
             )  # can only export pytorch models
             self.model.export(
-                    format=self.export_model_format, half=self.half_precision, simplify=True, nms=True,
+                    format=self.export_model_format, half=self.half_precision, simplify=True, nms=self.iou_thresh > 0.0,
                     # imgsz=tuple(imgsz),  # not necessary if dynamic=True
                     dynamic=True,
                     device=self.device
             )
 
             self.get_logger().info(f"Exported model to {self.export_model_format} format: {self.model_path}")
-            self.model_path = self.model_path.split('.')[:-1] + '.' + self.export_model_format
+            self.model_path = self.model_path.rsplit('.', 1)[0] + '.' + self.export_model_format  # self.model_path.rsplit('.', 1)[:-1]
 
         # if model_path ends with .engine or .onnx, try loading the file and export if FileNotFoundError
         if self.model_path.split('.')[-1] in ['engine', 'onnx']:
@@ -428,7 +436,7 @@ class ImageObstacleDetectionNode(Node):
                         format=self.model_path.split('.')[-1],
                         half=self.half_precision,
                         simplify=True,
-                        nms=True,
+                        nms=self.iou_thresh > 0.0,
                         # imgsz=tuple(imgsz),  # not necessary if dynamic=True
                         dynamic=True,
                         device=self.device
@@ -440,12 +448,17 @@ class ImageObstacleDetectionNode(Node):
                 self.model_path,
                 # task=self.task,
         )
+        try:
+            self.model.to(self.torch_device)
+        except TypeError:
+            pass
 
         # Filter classes
-        class_names = self.model.names
-        num_model_classes = len(class_names)
-        class_names_inv = {v: k for k, v in class_names.items()}
-        supported_class_names = set(class_names_inv.keys())
+        self.class_names: dict[int, str] = self.model.names
+        num_model_classes = len(self.class_names)
+        self.class_names_inv = {v: k for k, v in self.class_names.items()}
+        self.supported_class_names = set(self.class_names_inv.keys())
+        self.supported_class_keys = set(self.class_names.keys())
         if len(self.classes) == 0:
             self.classes = list(range(num_model_classes))
         else:
@@ -453,39 +466,111 @@ class ImageObstacleDetectionNode(Node):
                 assert self.classes < num_model_classes
                 self.classes = [self.classes]
             elif isinstance(self.classes, str):
-                self.classes = [int(x.strip()) for x in self.classes.split(',')]  # assert all ints less than num_model_classes
+                self.classes = [int(x.strip()) for x in
+                                self.classes.split(',')]  # assert all ints less than num_model_classes
                 assert all(x < num_model_classes for x in self.classes)
             elif isinstance(self.classes, list):
+                # remove empty strings from the list but keep 0
+                self.classes = [desired_class for desired_class in self.classes if desired_class or desired_class == 0]
+                # if classes is a list of strings
                 if isinstance(self.classes[0], str):
-                    assert all(x in supported_class_names for x in self.classes)
-                    self.classes = [class_names_inv[x.strip()] for x in self.classes]
+                    assert all(x in self.supported_class_names for x in self.classes)
+                    self.classes = [self.class_names_inv[x.strip()] for x in self.classes]
+                # if classes is a list of ints
+                elif isinstance(self.classes[0], int):
+                    assert all(x in self.supported_class_keys for x in self.classes)
+                else:
+                    raise ValueError("Classes must either be a list of ints or a strings.")
             else:
                 self.classes = list(self.classes)
 
-        self.get_logger().info(f"Only detecting classes: {[class_names[class_] for class_ in self.classes]}")
+        self.get_logger().info(f"Only detecting classes: {[self.class_names[class_] for class_ in self.classes]}")
 
         self.results = None
         self.detection_image = None
-        self.cameras = ['rgb', 'depth'] if (self.use_depth and self.project_to_3d) else ['rgb']
-        self.camera_infos = {'rgb': None, 'depth': None}
-        self.camera_models = {'rgb': PinholeCameraModel(),
-                              'depth': PinholeCameraModel()}
-        self.o3d_camera_intrinsics = {'rgb': None,
-                                      'depth': None} if self.use_depth else {'rgb': None}
-        self.o3d_camera_models = {'rgb': o3d.camera.PinholeCameraIntrinsic(), 'depth': o3d.camera.PinholeCameraIntrinsic()}
-        self.images = {'rgb': None, 'depth': None, 'rgbd': None, 'pointcloud': None}  # todo: rename to frame
-        self.frame_ids = {'rgb': None, 'depth': None, 'rgbd': None, 'pointcloud': None}
-        self.headers = {'rgb': None, 'depth': None, 'rgbd': None, 'pointcloud': None}
-        self.msg_metadata = {'rgb': None, 'depth': None, 'rgbd': None, 'pointcloud': None}
-        if self.project_to_3d and self.use_pointcloud:
-            self.o3d_pointcloud = o3d.t.geometry.PointCloud(self.o3d_device)
+        self.cameras = ['rgb']
+        self.camera_infos = {'rgb': None}
+        self.camera_models = {'rgb': PinholeCameraModel()}
+        self.images = {'rgb': None}  # todo: rename rgb to frame
+        self.frame_ids = {'rgb': None}
+        self.headers = {'rgb': None}
+        self.msg_metadata = {'rgb': None}
+        if self.project_to_3d:
+            if self.use_depth:
+                self.cameras.append('depth')
+                self.camera_infos['depth'] = None
+                self.camera_models['depth'] = PinholeCameraModel()
+                depth_dict = {'depth': None, 'rgbd': None}
+                self.output_frame_to_rgb_tf = None
+                self.output_frame_to_rgb_tf_torch = None
+                self.images.update(depth_dict)
+                self.frame_ids.update(depth_dict)
+                self.headers.update(depth_dict)
+                self.msg_metadata.update(depth_dict)
+                self.previous_rgbd_image = None
+
+            if self.use_pointcloud:
+                self.images['pointcloud'] = None
+                self.frame_ids['pointcloud'] = None
+                self.headers['pointcloud'] = None
+                self.msg_metadata['pointcloud'] = {}
+                self.o3d_camera_intrinsics = {'rgb': None,
+                                              'depth': None} if self.use_depth else {'rgb': None}
+                self.o3d_camera_models = {'rgb': o3d.camera.PinholeCameraIntrinsic(),
+                                          'depth': o3d.camera.PinholeCameraIntrinsic()}
+                self.o3d_pointcloud = o3d.t.geometry.PointCloud(self.o3d_device)
+                self.camera_to_robot_tf_o3d = None
+                self.output_frame_to_rgb_tf = None
+                self.output_frame_to_rgb_tf_o3d = None
+                self.previous_pointcloud = None
+                # pointcloud unpacking variables. todo: use my pointcloud preprocessor class to handle this later
+                self.pointcloud_preprocessor_namespace = 'detection_pointcloud_preprocessor'
+                self.pointcloud_preprocessor = PointcloudPreprocessorNode(
+                        node_name=self.pointcloud_preprocessor_namespace, enabled=False,
+                        parameter_namespace=self.pointcloud_preprocessor_namespace)
+                # to get the dict of all parameters: self.pointcloud_preprocessor.get_parameters_by_prefix(prefix=self.pointcloud_preprocessor_namespace.rstrip('.'))
+                self.pointcloud_preprocessor_namespace_param = f'{self.pointcloud_preprocessor_namespace}.'
+                self.pointcloud_preprocessor.set_parameters(
+                        [
+                            Parameter(f'{self.pointcloud_preprocessor_namespace_param}use_gpu', Parameter.Type.BOOL,
+                                      self.use_gpu),
+                            Parameter(f'{self.pointcloud_preprocessor_namespace_param}transform_pointcloud',
+                                      Parameter.Type.BOOL,
+                                      True),
+                            Parameter(f'{self.pointcloud_preprocessor_namespace_param}transform_before_preprocessing',
+                                      Parameter.Type.BOOL,
+                                      False),
+                            Parameter(f'{self.pointcloud_preprocessor_namespace_param}robot_frame', Parameter.Type.STRING,
+                                      self.output_frame),
+                            Parameter(f'{self.pointcloud_preprocessor_namespace_param}static_camera_to_robot_tf', Parameter.Type.BOOL,
+                                      self.static_camera_to_robot_tf),
+                            Parameter(f'{self.pointcloud_preprocessor_namespace_param}transform_timeout',
+                                      Parameter.Type.DOUBLE,
+                                      self.transform_timeout),
+                            Parameter(f'{self.pointcloud_preprocessor_namespace_param}crop_to_roi', Parameter.Type.BOOL, self.crop_to_roi),
+                            Parameter(f'{self.pointcloud_preprocessor_namespace_param}roi_min', Parameter.Type.DOUBLE_ARRAY,
+                                      self.roi_min),
+                            Parameter(f'{self.pointcloud_preprocessor_namespace_param}roi_max',
+                                      Parameter.Type.DOUBLE_ARRAY,
+                                      self.roi_max),
+                            Parameter(f'{self.pointcloud_preprocessor_namespace_param}voxel_size',
+                                      Parameter.Type.DOUBLE,
+                                      self.voxel_size),
+                            Parameter(f'{self.pointcloud_preprocessor_namespace_param}remove_statistical_outliers', Parameter.Type.BOOL,
+                                      self.remove_statistical_outliers),
+                            Parameter(f'{self.pointcloud_preprocessor_namespace_param}estimate_normals',
+                                      Parameter.Type.BOOL,
+                                      self.estimate_normals),
+                            Parameter(f'{self.pointcloud_preprocessor_namespace_param}remove_ground',
+                                      Parameter.Type.BOOL,
+                                      self.remove_ground),
+                        ]
+                )
+
         self.previous_time = time.time()
         self.previous_callback_time = None
         self.last_timestamp = None
         self.camera_to_robot_tf = None
-        self.camera_to_robot_tf_o3d = None
-        self.previous_rgbd_image = None
-        self.previous_pointcloud = None
 
         try:
             self.get_logger().info("Fusing model...")
@@ -529,6 +614,49 @@ class ImageObstacleDetectionNode(Node):
             self.image_message_format = "compressed"
             self.image_message_type = CompressedImage
 
+        # Setup inference dictionary
+        self.inference_dict = {
+            'source': None,
+            'conf': self.conf_thresh,
+            'iou': self.iou_thresh,
+            'imgsz': self.imgsz,
+            'device': self.device,
+            'half': self.half_precision,
+            'classes': self.classes,
+            'max_det': self.max_det,
+            'retina_masks': True,
+            'show': False,
+            'stream': False,
+            'augment': self.augment,
+            'agnostic_nms': self.agnostic_nms,
+            'verbose': self.verbose
+        }
+
+        # (optional) modify tracker parameters
+        if self.track_2d:
+            with open(self.tracker_2d_cfg['path'], 'r') as file:
+                tracker_config = yaml.safe_load(file)
+
+            for k, new_v in self.tracker_2d_cfg.copy().items():
+                if k in tracker_config.keys():
+                    tracker_config[k] = update_tracker_param(k, new_value=new_v, old_value=tracker_config[k])
+
+            assert tracker_config['tracker_type'] in [
+                "bytetrack",
+                "botsort",
+            ], f"Only 'bytetrack' and 'botsort' are supported for now, but got '{tracker_config['tracker_type']}'"
+
+            # Create a temporary file
+            self.temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.yaml')
+            yaml.safe_dump(tracker_config, self.temp_file, default_flow_style=False, sort_keys=False)
+
+            self.tracker_2d_cfg['path'] = self.temp_file.name
+
+        # Setup dynamic parameter reconfiguring.
+        # Register a callback function that will be called whenever there is an attempt to
+        # change one or more parameters of the node.
+        self.add_on_set_parameters_callback(self.parameter_change_callback)
+
         # Subscribers
         self.subscriptions_ = []
         self.image_sub = Subscriber(self, self.image_message_type, self.input_image_topic, qos_profile=qos_profile)
@@ -543,12 +671,16 @@ class ImageObstacleDetectionNode(Node):
                 self.depth_camera_info_sub = Subscriber(self, CameraInfo, self.depth_camera_info_topic,
                                                         qos_profile=qos_profile)
                 self.subscriptions_.append(self.depth_camera_info_sub)
-                
+
             if self.use_pointcloud:
                 self.pointcloud_sub = Subscriber(self, PointCloud2, self.pointcloud_topic, qos_profile=qos_profile)
                 self.subscriptions_.append(self.pointcloud_sub)
 
-        self.ts = ApproximateTimeSynchronizer(self.subscriptions_, self.queue_size, slop=0.1)
+        if self.synchronization_interval > 0.0:
+            self.ts = ApproximateTimeSynchronizer(self.subscriptions_, self.queue_size,
+                                                  slop=self.synchronization_interval)
+        else:
+            self.ts = TimeSynchronizer(self.subscriptions_, self.queue_size)
         self.ts.registerCallback(self.detection_callback)
 
         # Publishers
@@ -559,7 +691,7 @@ class ImageObstacleDetectionNode(Node):
         self.object_array_pub = self.create_publisher(
                 ObjectArray,
                 'yolo/objects',
-                qos_profile
+                self.queue_size
         )
 
         try:
@@ -567,21 +699,6 @@ class ImageObstacleDetectionNode(Node):
         except NameError:
             pass
 
-        if self.project_to_3d:
-            if self.use_depth:
-                self.detection3d_depth_results_pub = self.create_publisher(Detection3DArray,
-                                                                           "/yolo/detection3d_depth_results",
-                                                                           self.queue_size)
-                self.marker_depth_pub = self.create_publisher(MarkerArray,
-                                                              '/detection3d_depth_markers',
-                                                              self.queue_size)
-            if self.use_pointcloud:
-                self.detection3d_pointcloud_results_pub = self.create_publisher(Detection3DArray,
-                                                                           "/yolo/detection3d_pointcloud_results",
-                                                                           self.queue_size)
-                self.marker_pointcloud_pub = self.create_publisher(MarkerArray,
-                                                              '/detection3d_pointcloud_markers',
-                                                              self.queue_size)
         if self.publish_debug_image:
             if self.detection_image_topic:
                 self.detection_image_pub = self.create_publisher(self.image_message_type,
@@ -594,6 +711,21 @@ class ImageObstacleDetectionNode(Node):
             if self.segmentation_mask_image_topic:
                 self.segmentation_mask_image_pub = self.create_publisher(self.image_message_type,
                                                                          self.segmentation_mask_image_topic, self.queue_size)
+        if self.project_to_3d:
+            if self.use_depth:
+                self.detection3d_depth_results_pub = self.create_publisher(Detection3DArray,
+                                                                           "yolo/detection3d_depth_results",
+                                                                           self.queue_size)
+                self.marker_depth_pub = self.create_publisher(MarkerArray,
+                                                              'yolo/detection3d_depth_markers',
+                                                              self.queue_size)
+            if self.use_pointcloud:
+                self.detection3d_pointcloud_results_pub = self.create_publisher(Detection3DArray,
+                                                                           "yolo/detection3d_pointcloud_results",
+                                                                           self.queue_size)
+                self.marker_pointcloud_pub = self.create_publisher(MarkerArray,
+                                                              'yolo/detection3d_pointcloud_markers',
+                                                              self.queue_size)
 
         # # Timers
         # self.timer = self.create_timer(0.1, self.timer_callback)
@@ -605,20 +737,6 @@ class ImageObstacleDetectionNode(Node):
         """
         Todo: If the input to YOLO is not a Pytorch Tensor, the array is converted to RGB using numpy.
         Therefore, manually transfer the image to a torch tensor and perform operations (e.g color conversion and resizing) using torch before passing to YOLO to reduce CPU utilization. """
-        # Save/update camera infos
-        for camera in self.cameras:
-            # initialize the camera infos and models
-            if self.camera_infos[camera] is None:
-                self.camera_infos[camera] = msg[1] if camera == 'rgb' else msg[3]
-                self.camera_models[camera].fromCameraInfo(self.camera_infos[camera])
-                self.o3d_camera_intrinsics[camera] = self.convert_to_open3d_tensor(self.camera_models[camera].K)
-
-            # update the camera infos and models if not static
-            if not self.static_camera_info:
-                self.camera_infos[camera] = msg[1] if camera == 'rgb' else msg[3]
-                self.camera_models[camera].fromCameraInfo(self.camera_infos[camera])
-                self.o3d_camera_intrinsics[camera] = self.convert_to_open3d_tensor(self.camera_models[camera].K)
-
         try:
             msg_timestamp = None
             msg_fmt = "bgr8"
@@ -626,9 +744,11 @@ class ImageObstacleDetectionNode(Node):
             inverse_conversion = None
             is_color = True
             is_depth = False
+            self.camera_info_callback(msg)
             for camera in self.cameras:
                 img_msg = msg[0] if camera == 'rgb' else msg[2]
-                cv_image, msg_encoding, image_frame_id, msg_timestamp, msg_fmt, conversion, inverse_conversion, is_color, is_depth, compressed_msg_codec = self.parse_image_message(img_msg)
+                cv_image, msg_encoding, image_frame_id, msg_timestamp, msg_fmt, conversion, inverse_conversion, is_color, is_depth, compressed_msg_codec = _parse_image_message(
+                    img_msg, self.bridge, self.image_message_format, depth_scale=self.depth_scale, logger=self.get_logger())
                 self.frame_ids[camera] = image_frame_id
                 self.headers[camera] = img_msg.header
                 self.msg_metadata[camera] = {'msg_encoding': msg_encoding, 'msg_timestamp': msg_timestamp,
@@ -649,31 +769,58 @@ class ImageObstacleDetectionNode(Node):
                             self.imgsz = (new_height, new_width)
                             self.get_logger().info(f"Using image dimensions: {self.imgsz}")
                         else:
-                            self.imgsz = (640, 640)
+                            self.imgsz = list(self.image_dimensions)  # [640, 640]
 
                     # (optional) resize the image
                     if self.resize_image and self.use_image_dimensions and (
                             (self.image_height, self.image_width) != (self.imgsz[0], self.imgsz[1])):
-                        cv_image = cv2.resize(cv_image, (self.imgsz[1], self.imgsz[0]), interpolation=cv2.INTER_LINEAR)
+                        cv_image = cv2.resize(cv_image,
+                                              (self.imgsz[1], self.imgsz[0]))  # , interpolation=cv2.INTER_LINEAR
 
                 # update the image dictionary
                 self.images[camera] = cv_image
 
+            self.inference_dict['imgsz'] = self.imgsz
             # detect/track objects in the visual image
             self.detect_objects(self.images['rgb'])
 
             if self.project_to_3d and self.use_pointcloud:
-                # Clear the pointcloud
-                self.o3d_pointcloud.clear()
                 # unpack pointcloud message
                 ros_cloud = msg[-1]
-                pc_frame_id, pc_msg_timestamp, pc_fields = self.unpack_pointcloud_message(ros_cloud)
+                # extract PointCloud from struct message
+                self.pointcloud_preprocessor.extract_pointcloud(ros_cloud)
 
-                if pc_frame_id is not None:
-                    self.frame_ids['pointcloud'] = pc_frame_id
-                    self.headers['pointcloud'] = ros_cloud.header
-                    self.msg_metadata['pointcloud'] = {'msg_timestamp': pc_msg_timestamp, 'field_names': pc_fields}
-                    self.images['pointcloud'] = self.o3d_pointcloud.point.positions.cpu().numpy()
+                # Preprocess pointcloud: if input is a pointcloud, transform the pointcloud here
+                self.frame_ids['pointcloud'] = ros_cloud.header.frame_id
+                self.headers['pointcloud'] = ros_cloud.header
+                self.msg_metadata['pointcloud'] = {
+                    'msg_timestamp': ros_cloud.header.stamp,  # None
+                }
+
+                # get transform to robot frame
+                self.get_camera_to_robot_tf(
+                        self.frame_ids['pointcloud'],
+                        None if self.static_camera_to_robot_tf else self.msg_metadata['pointcloud'].get('msg_timestamp'),
+                )
+                self.pointcloud_preprocessor.camera_to_robot_tf = self.camera_to_robot_tf_o3d
+
+                # preprocess the pointcloud
+                self.pointcloud_preprocessor.preprocess()
+                new_header = self.pointcloud_preprocessor.create_header(ros_cloud)
+                pc_fields = self.pointcloud_preprocessor.pointcloud_metadata['field_names']
+                self.msg_metadata['pointcloud']['field_names'] = pc_fields
+
+                # copy the pointcloud.  todo: use one instead of all(self.o3d_pointcloud, self.pointcloud_preprocessor.o3d_pointcloud, self.images['pointcloud'])
+                self.o3d_pointcloud = self.pointcloud_preprocessor.o3d_pointcloud.clone()
+                # todo: transform the pointcloud in case the PointCloud Preprocessor node fails to transform
+                # if self.camera_to_robot_tf_o3d is not None:
+                #     # copy the original positions before transforming for later use without inversion.
+                #     # Leads to significant speedup over multiple transformations.
+                #     self.o3d_pointcloud.point.positions_inv = self.o3d_pointcloud.point.positions.clone()
+                #     frame_id = self.output_frame
+
+                if not self.o3d_pointcloud.is_empty():
+                    self.images['pointcloud'] = self.o3d_pointcloud.point.positions  # .cpu().numpy()  # todo: refactor without transfering to CPU or using numpy, i.e use torch tensors
 
             # try:
             #    self.results = next(self.results)
@@ -720,7 +867,10 @@ class ImageObstacleDetectionNode(Node):
 
                     if self.segmentation_image_topic and (mask_img is not None):
                         # color_mask_img = cv2.cvtColor(mask_img, cv2.COLOR_GRAY2BGR)
-                        cv_image_inverted = cv2.cvtColor(self.images['rgb'], self.msg_metadata['rgb'].get('inverse_conversion'))
+                        cv_image_inverted = self.images['rgb']
+                        if self.msg_metadata['rgb'].get('inverse_conversion') is not None:
+                            cv_image_inverted = cv2.cvtColor(self.images['rgb'],
+                                                             self.msg_metadata['rgb'].get('inverse_conversion'))
                         color_mask_img = cv2.bitwise_and(cv_image_inverted, cv_image_inverted, mask=mask_img)
                         if self.show_image:
                             cv2.imshow("color_mask_image", color_mask_img)
@@ -728,12 +878,13 @@ class ImageObstacleDetectionNode(Node):
 
                         if self.image_message_format in ("compressed", "packet"):
                             color_mask_image_msg = self.bridge.cv2_to_compressed_imgmsg(
-                                    color_mask_img,
-                                    dst_format=self.msg_metadata['rgb'].get('compressed_msg_codec'))  # msg.format.split(';')[1].split()[0]
+                                color_mask_img,
+                                dst_format=self.msg_metadata['rgb'].get(
+                                    'compressed_msg_codec'))  # msg.format.split(';')[1].split()[0]
                         else:
                             color_mask_image_msg = self.bridge.cv2_to_imgmsg(
-                                    color_mask_img,
-                                    encoding=self.msg_metadata['rgb'].get('msg_fmt'))
+                                color_mask_img,
+                                encoding=self.msg_metadata['rgb'].get('msg_fmt', 'bgr8'))  # passthrough
 
                         color_mask_image_msg.header.frame_id = self.frame_ids['rgb']
                         color_mask_image_msg.header.stamp = self.headers['rgb'].stamp
@@ -741,74 +892,30 @@ class ImageObstacleDetectionNode(Node):
 
         except Exception as e:
             self.get_logger().error(f'Error processing image: {e}')
+            raise e
+            # if self.debug:
+            #     raise e
 
-    def parse_image_message(self, msg):
-        image_frame_id = msg.header.frame_id
-        msg_timestamp = msg.header.stamp
-        msg_fmt = "bgr8"
-        compressed_msg_codec = None
-        conversion = None
-        inverse_conversion = None
-        is_color = True
-        is_depth = False
-        if self.image_message_format == "raw":
-            msg_encoding = msg.encoding
 
-        elif self.image_message_format == 'compressed':
-            # format: rgb8; jpeg compressed bgr8
-            msg_info = msg.format
-            msg_encoding_split = msg_info.split(';')
-            uncompressed_msg_fmt = msg_encoding_split[0]
-            compressed_img_info = msg_encoding_split[1].split()
-            compressed_msg_codec = compressed_img_info[0]
-            msg_encoding = compressed_img_info[-1]
+    def camera_info_callback(self, msg):
+        # Save/update camera infos
+        for camera in self.cameras:
+            # initialize the camera infos and models
+            if self.camera_infos[camera] is None:
+                self.camera_infos[camera] = msg[1] if camera == 'rgb' else msg[3]
+                self.camera_models[camera].fromCameraInfo(self.camera_infos[camera])
+                if self.use_pointcloud:
+                    self.o3d_camera_intrinsics[camera] = self.convert_to_open3d_tensor(self.camera_models[camera].K)
 
-        # set the desired output encoding
-        # (http://wiki.ros.org/cv_bridge/Tutorials/UsingCvBridgeToConvertBetweenROSImagesAndOpenCVImages#cv_bridge.2FTutorials.2FUsingCvBridgeCppDiamondback.Converting_ROS_image_messages_to_OpenCV_images)
-        if (msg_encoding.find("mono8") != -1) or (msg_encoding.find("8UC1") != -1):
-            msg_fmt = "mono8"  # "8UC1"
-            is_color = False
-            conversion = cv2.COLOR_GRAY2BGR
-            inverse_conversion = cv2.COLOR_BGR2GRAY
-        elif msg_encoding.find("bgra") != -1:
-            msg_fmt = "bgra8"  # "8UC4"
-            conversion = cv2.COLOR_BGRA2BGR
-            inverse_conversion = cv2.COLOR_BGR2BGRA
-        elif msg_encoding.find("rgba") != -1:
-            msg_fmt = "rgba8"  # "8UC4"
-            conversion = cv2.COLOR_RGBA2BGR
-            inverse_conversion = cv2.COLOR_BGR2RGBA
-        elif msg_encoding.find("bgr8") != -1:
-            msg_fmt = "bgr8"  # or 8UC3
-            # conversion = cv2.COLOR_BGR2BGR
-            # inverse_conversion = cv2.COLOR_BGR2BGR
-        elif (msg_encoding.find("rgb8") != -1):
-            msg_fmt = "rgb8"  # or 8UC3
-            conversion = cv2.COLOR_RGB2BGR
-            inverse_conversion = cv2.COLOR_BGR2RGB
-        elif msg_encoding.find("16UC1") != -1:
-            msg_fmt = "16UC1"  # "16UC1", mono16
-            is_color = False
-            is_depth = True
-            # raise NotImplementedError("Depth images are not supported for YOLO detection")
-            #conversion = cv2.COLOR_GRAY2BGR
-            #inverse_conversion = cv2.COLOR_BGR2GRAY
-        else:
-            self.get_logger().error("Unsupported encoding:", msg_encoding)
-            self.exit(1)
+            # update the camera infos and models if not static
+            if not self.static_camera_info:
+                self.camera_infos[camera] = msg[1] if camera == 'rgb' else msg[3]
+                self.camera_models[camera].fromCameraInfo(self.camera_infos[camera])
+                if self.use_pointcloud:
+                    self.o3d_camera_intrinsics[camera] = self.convert_to_open3d_tensor(self.camera_models[camera].K)
 
-        # convert ROS2 image message to OpenCV
-        if self.image_message_format in ("compressed", "packet"):
-            cv_image = self.bridge.compressed_imgmsg_to_cv2(msg, msg_fmt)
-        else:
-            cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding=msg_fmt)
-
-        if conversion is not None:
-            cv_image = cv2.cvtColor(cv_image, conversion)
-        return (cv_image, msg_encoding, image_frame_id, msg_timestamp, msg_fmt, conversion, inverse_conversion,
-                is_color, is_depth, compressed_msg_codec)
-
-    def unpack_pointcloud_message(self, ros_cloud):
+    def unpack_pointcloud_message_old(self, ros_cloud):
+        # todo: remove
         frame_id = ros_cloud.header.frame_id
         msg_timestamp = ros_cloud.header.stamp
         field_names = ('x', 'y', 'z', 'rgb')
@@ -875,98 +982,19 @@ class ImageObstacleDetectionNode(Node):
             # raise e
             return None, None, None
 
-    def preprocess_pointcloud(self, frame_id, timestamp):
-        # transform to robot frame
-        self.get_camera_to_robot_tf(frame_id, timestamp)
-
-        if self.camera_to_robot_tf_o3d is not None:
-            # copy the original positions before transforming for later use without inversion.
-            # Leads to significant speedup over multiple transformations.
-            self.o3d_pointcloud.point.positions_inv = self.o3d_pointcloud.point.positions.clone()
-            self.o3d_pointcloud = self.o3d_pointcloud.transform(self.camera_to_robot_tf_o3d)
-            frame_id = self.output_frame
-
-        ## Remove duplicate points
-        #start_time = time.time()
-        #mask = self.o3d_pointcloud.remove_duplicated_points()
-        #self.o3d_pointcloud = self.o3d_pointcloud.select_by_mask(mask)
-        #self.processing_times['remove_duplicate_points'] = time.time() - start_time
-
-        ## Remove NaN points
-        #start_time = time.time()
-        #self.o3d_pointcloud = self.o3d_pointcloud.remove_non_finite_points(remove_nan=True, remove_infinite=True)
-        #self.processing_times['remove_nan_points'] = time.time() - start_time
-
-        # ROI cropping
-        if self.crop_to_roi:
-            # points_o3d = points_o3d.crop(self.roi_min, self.roi_max)
-            mask = (
-                    (self.o3d_pointcloud.point.positions[:, 0] >= self.roi_min[0]) &
-                    (self.o3d_pointcloud.point.positions[:, 0] <= self.roi_max[0]) &
-                    (self.o3d_pointcloud.point.positions[:, 1] >= self.roi_min[1]) &
-                    (self.o3d_pointcloud.point.positions[:, 1] <= self.roi_max[1]) &
-                    (self.o3d_pointcloud.point.positions[:, 2] >= self.roi_min[2]) &
-                    (self.o3d_pointcloud.point.positions[:, 2] <= self.roi_max[2])
-            )
-            self.o3d_pointcloud = self.o3d_pointcloud.select_by_mask(mask)
-
-        # Voxel downsampling
-        if self.voxel_size > 0.0:
-            self.o3d_pointcloud = self.o3d_pointcloud.voxel_down_sample(self.voxel_size)
-
-        if self.remove_statistical_outliers:
-            self.o3d_pointcloud, _ = self.o3d_pointcloud.remove_statistical_outliers(nb_neighbors=20, std_ratio=2.0)
-
-        if self.estimate_normals:
-            self.o3d_pointcloud.estimate_normals(
-                    radius=0.1,  # Use a radius of 10 cm for local geometry
-                    max_nn=30  # Use up to 30 nearest neighbors
-            )
-
-        # Ground segmentation.
-        if self.remove_ground:
-            plane_model, inliers = self.o3d_pointcloud.segment_plane(
-                    distance_threshold=0.2,
-                    ransac_n=5,
-                    num_iterations=100
-            )
-            # ground_cloud = self.o3d_pointcloud.select_by_index(inliers)  # ground
-            self.o3d_pointcloud = self.o3d_pointcloud.select_by_index(inliers, invert=True)  #
-
     def detect_objects(self, image):
         try:
+            self.inference_dict['source'] = image
             if self.track_2d:
                 # https://docs.ultralytics.com/modes/track/#why-choose-ultralytics-yolo-for-object-tracking
                 self.results = self.model.track(
-                        source=image,
-                        conf=self.conf_thresh,
-                        iou=self.iou_thresh,
-                        imgsz=self.imgsz,
-                        device=self.device,
-                        half=self.half_precision,
-                        classes=self.classes,
-                        max_det=self.max_det,
-                        retina_masks=True,
-                        show=False,
-                        tracker=self.tracker_2d,
+                        tracker=self.tracker_2d_cfg['path'],
                         persist=True,
-                        stream=False
+                        **self.inference_dict
                 )
             else:
                 # https://docs.ultralytics.com/modes/predict/#inference-arguments
-                self.results = self.model.predict(
-                        source=image,
-                        conf=self.conf_thresh,
-                        iou=self.iou_thresh,
-                        imgsz=self.imgsz,
-                        device=self.device,
-                        half=self.half_precision,
-                        classes=self.classes,
-                        max_det=self.max_det,
-                        retina_masks=True,
-                        show=False,
-                        stream=False
-                )
+                self.results = self.model.predict(**self.inference_dict)
 
                 # # or control each step (predict/track does all three steps)
                 # im = model.predictor.preprocess(source)[0]
@@ -981,8 +1009,10 @@ class ImageObstacleDetectionNode(Node):
             detections_msg, mask_img = self.create_detections_array(results, header)
 
             return detections_msg, self.detection_image, mask_img
+        return None, None, None
 
     def create_detections_array(self, results, header):
+        # Create 2D result messages
         detections_msg = Detection2DArray()
         detections_msg.header.stamp = self.msg_metadata['rgb'].get('msg_timestamp')  # self.get_clock().now().to_msg()
         detections_msg.header.frame_id = self.frame_ids['rgb']
@@ -1011,38 +1041,47 @@ class ImageObstacleDetectionNode(Node):
                 if depth_timestamp is None:
                     depth_timestamp = self.get_clock().now().to_msg()
 
-                self.get_camera_to_robot_tf(self.frame_ids['depth'], depth_timestamp)
+                self.get_camera_to_robot_tf(
+                        self.frame_ids['depth'],
+                        None if self.static_camera_to_robot_tf else depth_timestamp,  # depth_timestamp
+                )
                 detection3d_depth_array = Detection3DArray()
                 detection3d_depth_array.header.frame_id = self.output_frame if self.output_frame else self.frame_ids['depth']
                 detection3d_depth_array.header.stamp = depth_timestamp
 
                 marker_depth_array = MarkerArray()
 
-            # Preprocess pointcloud: if input is a pointcloud, transform the pointcloud here
             if self.use_pointcloud:
-                pointcloud_timestamp = self.msg_metadata['pointcloud'].get(
-                    'msg_timestamp') if self.output_frame else self.msg_metadata['rgb'].get(
-                    'msg_timestamp')  # self.get_clock().now().to_msg()
-
-                if pointcloud_timestamp is None:
-                    pointcloud_timestamp = self.get_clock().now().to_msg()
-
-                self.preprocess_pointcloud(
-                    self.frame_ids['pointcloud'], pointcloud_timestamp)
                 detection3d_pointcloud_array = Detection3DArray()
                 detection3d_pointcloud_array.header.frame_id = self.output_frame if self.output_frame else self.frame_ids[
                     'pointcloud']
-                detection3d_pointcloud_array.header.stamp = pointcloud_timestamp
+                detection3d_pointcloud_array.header.stamp = self.msg_metadata['pointcloud'].get(
+                    'msg_timestamp') if self.output_frame else self.msg_metadata['rgb'].get(
+                    'msg_timestamp')  # self.get_clock().now().to_msg()
 
                 marker_pointcloud_array = MarkerArray()
 
 
         for result in results:
-            self.detection_image = result.plot()
+            self.detection_image = result.plot(
+                    conf=True,
+                    labels=True,
+                    boxes=True,
+                    masks=True,
+                    probs=True,
+                    # # todo: use the image below to specify the original image if passing an ROI masked image to the detector
+                    # img=self.inference_dict['source'] or self.images['rgb'],  # numpy image to overlay detections on. This is slower since it needs to be transferred to GPU
+                    # im_gpu=None,  # torch tensor image to overlay detections on. This is faster since it does not need to be transferred to GPU
+            )
             if self.show_image:
                 # Visualize the results on the frame
                 cv2.imshow("image", self.detection_image)
                 cv2.waitKey(1)
+
+            # use result.cpu().numpy()  # to move all at once. or result.to(device="cpu", dtype=torch.float32)
+            result = result.cpu()
+            # todo: do not hardcode cpu usage as we can postprocess with depth/pointcloud on GPU. Remove cpu() and numpy() calls
+
             bounding_box = result.boxes.cpu()  # Boxes object for bounding box outputs. n x 4
             classes = result.boxes.cls.cpu()  # n,
             confidence_score = result.boxes.conf.cpu()  # n,
@@ -1055,7 +1094,7 @@ class ImageObstacleDetectionNode(Node):
                 return detections_msg, mask_img
 
             track_ids = None
-            if self.track_2d:
+            if self.track_2d and bounding_box.is_track:
                 track_ids = result.boxes.id
                 if track_ids is not None:
                     track_ids = track_ids.int().cpu().tolist()
@@ -1119,7 +1158,7 @@ class ImageObstacleDetectionNode(Node):
 
                 if obstacle_msg is not None:
                     obstacle_2d = pack_nav2_obstacle_msg(
-                        bbox[0], bbox[1], bbox[2], bbox[3], result.names.get(int(cls)), conf, id=track_ids[i] if track_ids is not None else -1)
+                        bbox[0], bbox[1], bbox[2], bbox[3], result.names.get(int(cls)), conf, id=track_ids[i] if track_ids is not None else -1, z_size=0.0)  # todo: replace with height
                     obstacle_msg.obstacles.append(obstacle_2d)
 
                 if self.project_to_3d:
@@ -1128,47 +1167,47 @@ class ImageObstacleDetectionNode(Node):
                         x, y, z, size_x, size_y, size_z, quat, points_3d = self.project_to_3d_with_depth(
                             mask, bbox, self.images['depth'])
 
-                        if x is None:
-                            continue
+                        if x is not None:
+                            # transform the boxes to the robot frame
+                            frame_id = self.frame_ids["depth"]
+                            if self.output_frame:
+                                frame_id = self.output_frame
+                                # if self.camera_to_robot_tf is not None:
+                                #     x, y, z, size_x, size_y, size_z, points_3d = self.transform_bbox_3d(
+                                #         x, y, z, size_x, size_y, size_z, points_3d)
 
-                        # transform the boxes to the robot frame
-                        frame_id = self.frame_ids["depth"]
-                        if self.output_frame:
-                            frame_id = self.output_frame
-                            if self.camera_to_robot_tf is not None:
-                                x, y, z, size_x, size_y, size_z, points_3d = self.transform_bbox_3d(
-                                    x, y, z, size_x, size_y, size_z, points_3d)
-
-                        # Append 3D detection (x, y, z, size_x, size_y, size_z, confidence, class_id)
-                        detection3d_depth_array.detections.append(
-                            self.create_3d_detection(x, y, z, size_x, size_y, size_z, conf, result.names.get(int(cls))))
-                        marker_depth_array.markers.append(
-                            self.create_marker(
-                                i, x, y, z, size_x, size_y, size_z, frame_id,
-                                depth_timestamp, conf, result.names.get(int(cls)), track_id=None,
-                                rgba=[1.0, 0.0, 0.0, 0.5]))
+                            # Append 3D detection (x, y, z, size_x, size_y, size_z, confidence, class_id)
+                            # frame_id: output_frame (base_link) when set, else depth sensor frame
+                            detection3d_depth_array.detections.append(
+                                self.create_3d_detection(x, y, z, size_x, size_y, size_z, conf,
+                                                         result.names.get(int(cls)), frame_id=frame_id))
+                            marker_depth_array.markers.append(
+                                self.create_marker(
+                                    i, x, y, z, size_x, size_y, size_z, frame_id,
+                                    depth_timestamp, conf, result.names.get(int(cls)), track_id=None,
+                                    rgba=[1.0, 0.0, 0.0, 0.5]))
 
                     if self.use_pointcloud and (self.images['pointcloud'] is not None):
                         x, y, z, size_x, size_y, size_z, quat, points_3d = self.project_to_3d_with_pointcloud(
                             mask, bbox, self.images['pointcloud'])
 
-                        if x is None:
-                            continue
+                        if x is not None:
+                            # no need to transform the boxes to the robot frame since the pointcloud is transformed
+                            frame_id = self.frame_ids["pointcloud"] if not self.output_frame else self.output_frame
 
-                        # no need to transform the boxes to the robot frame since the pointcloud is transformed
-                        frame_id = self.frame_ids["pointcloud"] if not self.output_frame else self.output_frame
+                            # Append 3D detection (x, y, z, size_x, size_y, size_z, confidence, class_id)
+                            detection3d_pointcloud_array.detections.append(
+                                self.create_3d_detection(
+                                    x, y, z, size_x, size_y, size_z, conf, result.names.get(int(cls)), quat,
+                                    frame_id=frame_id)
+                            )
+                            marker_pointcloud_array.markers.append(
+                                self.create_marker(
+                                    i, x, y, z, size_x, size_y, size_z, frame_id,
+                                    self.msg_metadata['pointcloud'].get('msg_timestamp'), conf, result.names.get(int(cls)), track_id=None, quat=quat,
+                                    rgba=[0.0, 1.0, 0.0, 0.5]))
 
-                        # Append 3D detection (x, y, z, size_x, size_y, size_z, confidence, class_id)
-                        detection3d_pointcloud_array.detections.append(
-                            self.create_3d_detection(
-                                x, y, z, size_x, size_y, size_z, conf, result.names.get(int(cls)), quat)
-                        )
-                        marker_pointcloud_array.markers.append(
-                            self.create_marker(
-                                i, x, y, z, size_x, size_y, size_z, frame_id,
-                                pointcloud_timestamp, conf, result.names.get(int(cls)), track_id=None, quat=quat,
-                                rgba = [0.0, 1.0, 0.0, 0.5]))
-
+            # publish messages
             self.object_array_pub.publish(objects_msg)
 
             if obstacle_msg is not None:
@@ -1184,7 +1223,100 @@ class ImageObstacleDetectionNode(Node):
                     self.marker_pointcloud_pub.publish(marker_pointcloud_array)
         return detections_msg, mask_img
 
+    @staticmethod
+    def align_depth_to_rgb(depth_map, K_depth, K_rgb, T_depth_to_rgb, rgb_shape, depth_scale=1.0):
+        """
+        Aligns a depth map to the perspective of an RGB camera using PyTorch.
+
+        Args:
+            depth_map (torch.Tensor): Source depth image (H_d, W_d).
+            K_depth (torch.Tensor): Depth camera intrinsics (3, 3).
+            K_rgb (torch.Tensor): RGB camera intrinsics (3, 3).
+            T_depth_to_rgb (torch.Tensor): Transformation matrix (4, 4) from Depth to RGB.
+            rgb_shape (tuple): Target resolution (H_rgb, W_rgb).
+
+        Returns:
+            torch.Tensor: Aligned depth map matching the RGB resolution (H_rgb, W_rgb).
+        """
+        H_d, W_d = depth_map.shape
+        H_rgb, W_rgb = rgb_shape
+        device = depth_map.device
+
+        # 1. Create a grid of coordinates for the depth image
+        v, u = torch.meshgrid(torch.arange(H_d, device=device), torch.arange(W_d, device=device), indexing='ij')
+
+        # Flatten everything for vectorized operations
+        u = u.flatten()
+        v = v.flatten()
+        z = depth_map.flatten() / depth_scale
+
+        # Filter out invalid depth points (zeros or negative)
+        valid_mask = z > 0
+        u, v, z = u[valid_mask], v[valid_mask], z[valid_mask]
+
+        # 2. Unproject to 3D in Depth Coordinate System
+        # x = (u - cx) * z / fx
+        # y = (v - cy) * z / fy
+        cx_d, cy_d = K_depth[0, 2], K_depth[1, 2]
+        fx_d, fy_d = K_depth[0, 0], K_depth[1, 1]
+
+        x_3d = (u - cx_d) * z / fx_d
+        y_3d = (v - cy_d) * z / fy_d
+        ones = torch.ones_like(z)
+
+        # Stack to create homogeneous coordinates (4, N)
+        points_3d_depth = torch.stack([x_3d, y_3d, z, ones], dim=0)
+
+        # 3. Transform to RGB Coordinate System
+        # Apply the extrinsic matrix (R | T)
+        points_3d_rgb = T_depth_to_rgb @ points_3d_depth  # Matrix multiplication
+
+        # Extract transformed coordinates
+        x_rgb = points_3d_rgb[0, :]
+        y_rgb = points_3d_rgb[1, :]
+        z_rgb = points_3d_rgb[2, :]
+
+        # Filter points that are behind the RGB camera (z <= 0)
+        valid_z_mask = z_rgb > 0
+        x_rgb, y_rgb, z_rgb = x_rgb[valid_z_mask], y_rgb[valid_z_mask], z_rgb[valid_z_mask]
+
+        # 4. Project to 2D RGB Plane
+        # u' = (x' * fx' / z') + cx'
+        cx_rgb, cy_rgb = K_rgb[0, 2], K_rgb[1, 2]
+        fx_rgb, fy_rgb = K_rgb[0, 0], K_rgb[1, 1]
+
+        u_proj = (x_rgb * fx_rgb / z_rgb) + cx_rgb
+        v_proj = (y_rgb * fy_rgb / z_rgb) + cy_rgb
+
+        # Round to nearest integer pixel coordinates
+        u_proj = torch.round(u_proj).long()
+        v_proj = torch.round(v_proj).long()
+
+        # 5. Handle Bounds and Occlusions
+        # Filter points falling outside the RGB image resolution
+        in_bounds = (u_proj >= 0) & (u_proj < W_rgb) & (v_proj >= 0) & (v_proj < H_rgb)
+
+        u_final = u_proj[in_bounds]
+        v_final = v_proj[in_bounds]
+        z_final = z_rgb[in_bounds]
+
+        # Occlusion handling: Painter's Algorithm
+        # Sort by depth (descending) so closer points (processed last) overwrite further points
+        sorted_indices = torch.argsort(z_final, descending=True)
+        u_final = u_final[sorted_indices]
+        v_final = v_final[sorted_indices]
+        z_final = z_final[sorted_indices]
+
+        # Initialize output canvas
+        aligned_depth = torch.zeros((H_rgb, W_rgb), device=device, dtype=torch.float32)
+
+        # Assign values to the canvas
+        aligned_depth[v_final, u_final] = z_final
+
+        return aligned_depth * depth_scale
+
     def project_to_3d_with_depth(self, mask, xywh, depth_image):
+        # todo: refactor as this is wrong and does not work, e.g with carla
         """
         Steps:
             1. (optional) resize mask data (and xy) to the depth image size
@@ -1202,11 +1334,43 @@ class ImageObstacleDetectionNode(Node):
         bbox_center_x, bbox_center_y = map(int, xywh[:2])
         bbox_size_x, bbox_size_y = map(int, xywh[2:])
 
-        mask_data = mask.data.cpu().numpy().astype(np.uint8)[0, :, :] * 255
-        mask_xy = mask.xy[0]
+        # Step 1: Project the depth image to the RGB frame.
+        dtype = torch.float32
+        H_rgb, W_rgb = self.camera_models["rgb"].height, self.camera_models["rgb"].width  # or get from the image
+        cx_rgb, cy_rgb = self.camera_models["rgb"].cx(), self.camera_models["rgb"].cy()
+        fx_rgb, fy_rgb = self.camera_models["rgb"].fx(), self.camera_models['rgb'].fy()
+        k_rgb = self.camera_models["rgb"].K  # self.camera_infos['rgb'].k.reshape(3,3)
+
+        H_depth, W_depth = self.camera_models["depth"].height, self.camera_models["depth"].width  # or get from the image
+        cx_depth, cy_depth = self.camera_models["depth"].cx(), self.camera_models["depth"].cy()
+        fx_depth, fy_depth = self.camera_models["depth"].fx(), self.camera_models['depth'].fy()
+        k_depth = self.camera_models["depth"].K  # self.camera_infos['depth'].k.reshape(3,3)
+
+        # transform points to RGB
+        if self.output_frame_to_rgb_tf is None or not self.static_camera_to_robot_tf:
+            source_frame = self.frame_ids['depth']
+
+            transform = self.lookup_transform(source_frame, self.frame_ids['rgb'], rclpy.time.Time())
+
+            if transform is not None:
+                self.output_frame_to_rgb_tf = self.transform_to_matrix(transform)  # output_frame_to_rgb_tf
+                self.output_frame_to_rgb_tf_torch = torch.as_tensor(self.output_frame_to_rgb_tf, dtype=dtype, device=self.torch_device)
+
+        if (self.output_frame_to_rgb_tf_torch is not None) and not torch.equal(
+                self.output_frame_to_rgb_tf_torch,
+                torch.eye(self.output_frame_to_rgb_tf_torch.shape[0], dtype=dtype, device=self.torch_device)):
+            depth_image = self.align_depth_to_rgb(
+                    torch.from_numpy(depth_image).to(dtype=dtype, device=self.torch_device),
+                    torch.from_numpy(k_depth).to(dtype=dtype, device=self.torch_device),
+                    torch.from_numpy(k_rgb).to(dtype=dtype, device=self.torch_device),
+                    self.output_frame_to_rgb_tf_torch, (H_rgb, W_rgb), self.depth_scale)
+            depth_image = depth_image.cpu().numpy()
 
         # Step 2: Get the ROI of the mask (or bbox) in the depth image
         if mask is not None:
+            mask_data = mask.data.cpu().numpy().astype(np.uint8)[0, :, :] * 255
+            mask_xy = mask.xy[0]
+
             # crop depth image by mask
             # mask_array = np.array(
             #     [[int(ele[0]), int(ele[1])] for ele in mask_xy]
@@ -1215,9 +1379,7 @@ class ImageObstacleDetectionNode(Node):
             # cv2.fillPoly(mask_, [np.array(mask_array, dtype=np.int32)], 255)
             # roi = cv2.bitwise_and(depth_image, depth_image, mask=mask_)  # same as below
 
-            roi = cv2.bitwise_and(depth_image,
-                                   depth_image,
-                                   mask=mask_data)  # same as above
+            roi = cv2.bitwise_and(depth_image, depth_image, mask=mask_data)  # same as above
 
         else:
             # crop depth image by the 2d BB. todo: use xyxy
@@ -1305,8 +1467,11 @@ class ImageObstacleDetectionNode(Node):
         points_3d = np.column_stack((xs, ys, depths))
         return x, y, z, size_x, size_y, size_z, None, points_3d
 
-    def project_to_3d_with_pointcloud(self, mask, xywh, pointcloud=None):
-        if self.o3d_pointcloud.is_empty() and pointcloud is None:
+    def project_to_3d_with_pointcloud(self, mask, xywh, points=None):
+        # todo: refactor to handle multiple detections
+        # todo: use points and avoid using self.o3d_pointcloud
+        # todo: refactor this to also use bbox instead of masks only
+        if self.o3d_pointcloud.is_empty() and points is None:
             # Ensure the point cloud is in memory
             self.get_logger().info(f"Pointcloud is empty")
             return None, None, None, None, None, None, None, None
@@ -1317,28 +1482,53 @@ class ImageObstacleDetectionNode(Node):
         cx, cy = self.camera_models["rgb"].cx(), self.camera_models["rgb"].cy()
         fx, fy = self.camera_models["rgb"].fx(), self.camera_models['rgb'].fy()
 
-        mask_data = mask.data[0, :, :]
-        mask_data = (o3c.Tensor.from_dlpack(torch.utils.dlpack.to_dlpack(mask_data)).to(o3c.Dtype.Int64) * 255)
+        mask_data = (mask.data[0, :, :] * 255)
+        mask_data = o3c.Tensor.from_dlpack(torch.utils.dlpack.to_dlpack(mask_data)).to(o3c.Dtype.Int64).to(self.o3d_device)
         mask_xy = mask.xy[0]
 
-        points = self.o3d_pointcloud.point.positions
+        if points is None:
+            points = self.o3d_pointcloud.point.positions.clone()
 
-        # project back to the camera frame if the points were projected to the robots frame to project to the image
-        if self.output_frame and self.camera_to_robot_tf_o3d is not None:
-            # self.o3d_pointcloud = self.o3d_pointcloud.transform(self.camera_to_robot_tf_o3d.inv())
-            points = self.o3d_pointcloud.point.positions_inv
+        # Step 1: Apply the extrinsics to the camera frame from the current frame, i.e apply camera -> self.output_frame extrinsics
+        points_ = points.clone()
 
-        # Step 1: Project 3D points to 2D image plane
-        x_2d = (points[:, 0] * fx / points[:, 2]) + cx
-        y_2d = (points[:, 1] * fy / points[:, 2]) + cy
+        if self.output_frame_to_rgb_tf is None or not self.static_camera_to_robot_tf:
+            # source_frame = self.output_frame or self.frame_ids['pointcloud']
+            source_frame = self.frame_ids['pointcloud']
+            if self.output_frame and self.pointcloud_preprocessor.transform_pointcloud:
+                source_frame = self.output_frame
 
-        # Step 2: project the mask to the pointcloud
-        valid_points_mask = (x_2d >= 0) & (x_2d < mask_data.shape[1]) & \
-                       (y_2d >= 0) & (y_2d < mask_data.shape[0])  # Find points that project into the mask image
+            transform = self.lookup_transform(
+                    source_frame, self.frame_ids['rgb'], rclpy.time.Time())
+
+            if transform is not None:
+                self.output_frame_to_rgb_tf = self.transform_to_matrix(transform)  # output_frame_to_rgb_tf
+                self.output_frame_to_rgb_tf_o3d = o3c.Tensor(self.output_frame_to_rgb_tf, dtype=o3c.float32, device=self.o3d_device)
+
+        if self.output_frame_to_rgb_tf_o3d is not None:
+            points_ = self.o3d_pointcloud.clone().transform(self.output_frame_to_rgb_tf_o3d).point.positions  # points.transform(extrinsic_matrix_o3d)
+
+        # # project back to the camera frame if the points were projected to the robots frame to project to the image
+        # if self.output_frame and (self.camera_to_robot_tf_o3d is not None):
+        #     # self.o3d_pointcloud = self.o3d_pointcloud.transform(self.camera_to_robot_tf_o3d.inv())
+        #     points = self.o3d_pointcloud.point.positions_inv
+
+        # Step 2: Project 3D points to 2D image plane
+        x_ = points_[:, 0]
+        y_ = points_[:, 1]
+        z_ = points_[:, 2]
+        x_2d = (x_ * fx / z_) + cx
+        y_2d = (y_ * fy / z_) + cy
+
+        # Step 3: remove points outside the fov of the RGB camera
+        image_width = mask_data.shape[1]
+        image_height = mask_data.shape[0]
+        valid_points_mask = (x_2d >= 0) & (x_2d < image_width) & \
+                       (y_2d >= 0) & (y_2d < image_height)  # Find points that project into the mask image
 
         # Filter valid projected points
         # valid_projected_points = self.o3d_pointcloud.point.positions[valid_points_mask]
-        valid_projected_points = self.o3d_pointcloud.select_by_mask(valid_points_mask)
+        valid_projected_points = self.o3d_pointcloud.select_by_mask(valid_points_mask)  # points.select_by_mask(valid_points_mask)
 
         if valid_projected_points.is_empty():
             return None, None, None, None, None, None, None, None
@@ -1346,49 +1536,36 @@ class ImageObstacleDetectionNode(Node):
         valid_x_2d = x_2d[valid_points_mask].to(o3c.Dtype.Int64)
         valid_y_2d = y_2d[valid_points_mask].to(o3c.Dtype.Int64)
 
-        # Get mask values for these points.
+        # Get mask values for these points. todo: could also use RGB image
         mask_values = mask_data[valid_y_2d, valid_x_2d]
 
-        # Select points that fall within the mask
+        # Select points that fall within the mask. todo: could use bounding boxes, i.e in the rgb image, find points that land in bounding boxes
         # masked_points = valid_projected_points[mask_values > 0]
         masked_points = valid_projected_points.select_by_mask(mask_values > 0)
 
-        # Step 3: cluster points and get bounding boxes. todo: move this outside of the loop to perform once
-        clusters, bboxes = self.cluster_points(masked_points)
+        # Step 4: cluster points and get the bounding box. todo: move this outside of the loop to perform once
+        clusters, bboxes, centers, extents, quats = self.cluster_points(masked_points)
         # only select the cluster with the largest label
         # get the center (if not using the bbox)
         # centroid = np.mean(clustered_points, axis=0)
         if bboxes:
-            for bbox in bboxes:
-                if self.bounding_box_type.lower() == "obb":
-                    center = bbox.center.cpu().numpy().tolist()
-                    extent = bbox.extent.cpu().numpy().tolist()
-                    # Convert rotation matrix to quaternion
-                    R = bbox.rotation.cpu().numpy()
-                    quat = quaternion_from_matrix(np.vstack((np.hstack((R, [[0], [0], [0]])), [0, 0, 0, 1])))
-                    quat = Quaternion(x=float(quat[0]), y=float(quat[1]), z=float(quat[2]), w=float(quat[3]))
-
-                else:
-                    center = bbox.get_center().cpu().numpy().tolist()
-                    extent = bbox.get_extent().cpu().numpy().tolist()
-                    quat = None
-                x, y, z = center
-                size_x, size_y, size_z = extent
-            return x, y, z, size_x, size_y, size_z, quat, clusters
+            x, y, z = centers[0]
+            size_x, size_y, size_z = extents[0]
+            return x, y, z, size_x, size_y, size_z, quats[0], clusters
         return None, None, None, None, None, None, None, None
 
     def cluster_points(self, o3d_pcd):
         """
         Perform DBSCAN clustering and return clusters with their bounding boxes.
         Return the list of clusters.
-        Todo: remove clusters with more points than self.max_cluster_size
+        Todo: call the "get_clusters" method in euclidean_clustering node
         """
         # self.get_logger().info("Clustering point cloud with DBSCAN...")
 
         # Ensure the point cloud is in memory
         if o3d_pcd.is_empty():
             self.get_logger().info(f"Pointcloud is empty")
-            return [], []
+            return [], [], [], [], []
 
         # Use GPU DBSCAN clustering
         labels = o3d_pcd.cluster_dbscan(
@@ -1403,18 +1580,25 @@ class ImageObstacleDetectionNode(Node):
         # labels = labels.cpu().numpy()
         # unique_labels, counts = np.unique(labels[labels != -1], return_counts=True)  # largest_cluster_label = max(labels, key=lambda l: np.sum(labels == l))
         unique_labels, counts = torch.unique(labels[labels != -1], return_counts=True)
+        # unique_labels, counts = set(labels.tolist()), None
 
         if len(unique_labels) == 0:
             self.get_logger().info(f"unique labels: {unique_labels}, len: {len(unique_labels)}")
-            return [], []  # Return empty lists if no valid clusters
+            return  [], [], [], [], []  # Return empty lists if no valid clusters
 
         # unique_labels = unique_labels[unique_labels >= 0]
 
         max_label = labels.max().item()
         self.get_logger().info(f"DBSCAN found {max_label + 1} clusters")
 
+        # if self.max_cluster_size > 0 and counts is not None:
+        #     counts_less_than_cluster_size = counts < self.max_cluster_size
+        #     unique_labels = unique_labels[counts_less_than_cluster_size]
+        #     # counts = counts[counts_less_than_cluster_size]
+
         clusters = []
         bboxes = []
+        centers, extents, quats = [], [], []
 
         for label in unique_labels:
             # Create mask for current cluster
@@ -1429,31 +1613,54 @@ class ImageObstacleDetectionNode(Node):
             # Create new pointcloud for cluster
             cluster_pcd = o3d_pcd.select_by_mask(mask)
 
-            # # Get cluster height. todo: use mask
-            # points = cluster_pcd.point.positions.cpu().numpy()
-            # min_z = np.min(points[:, 2])
-            # max_z = np.max(points[:, 2])
-            # height = max_z - min_z
-            #
-            # # Filter clusters by height
-            # if height < self.cluster_min_height or height > self.cluster_max_height:
+            if cluster_pcd.is_empty():
+                continue
+
+            points = cluster_pcd.point.positions
+
+            # # remove large clusters. This is redundant since we already removed unique_labels with counts < self.max_cluster_size
+            # if 0 < self.max_cluster_size < points.shape[0]:
+            #     continue
+
+            # Get cluster height
+            min_z = points[:, 2].min().item()
+            max_z = points[:, 2].max().item()
+            height = max_z - min_z
+
+            # # Filter clusters by height. height < self.cluster_min_height or height > self.cluster_max_height
+            # if not (self.cluster_min_height <= height <= self.cluster_max_height):
             #     continue
 
             clusters.append(cluster_pcd)
 
             if self.bounding_box_type.lower() == "aabb":
                 bounding_box = cluster_pcd.get_axis_aligned_bounding_box()
+                center = bounding_box.get_center().cpu().numpy().tolist()
+                extent = bounding_box.get_extent().cpu().numpy().tolist()
+                quat = None  # aabb does not have orientation
             elif self.bounding_box_type.lower() == "obb":
                 bounding_box = cluster_pcd.get_oriented_bounding_box()
+                center = bounding_box.center.cpu().numpy().tolist()
+                extent = bounding_box.extent.cpu().numpy().tolist()
+                # Convert rotation matrix to quaternion
+                R = bounding_box.rotation.cpu().numpy()
+                quat = quaternion_from_matrix(np.vstack((np.hstack((R, [[0], [0], [0]])), [0, 0, 0, 1])))
+                quat = Quaternion(x=float(quat[0]), y=float(quat[1]), z=float(quat[2]), w=float(quat[3]))
             else:
                 raise ValueError(f"Unknown bounding box type: {self.bounding_box_type}")
 
             bboxes.append(bounding_box)
+            centers.append(center)
+            extents.append(extent)
+            quats.append(quat)
 
-        return clusters, bboxes
+        return clusters, bboxes, centers, extents, quats
 
-    def create_3d_detection(self, x, y, z, size_x, size_y, size_z, confidence, class_id, quat=None):
+    def create_3d_detection(self, x, y, z, size_x, size_y, size_z, confidence, class_id, quat=None, frame_id=None):
         det_msg = Detection3D()
+        # frame_id: 3D detections live in output_frame (base_link by default)
+        if frame_id:
+            det_msg.header.frame_id = frame_id
         det_msg.bbox.center.position.x = float(x)
         det_msg.bbox.center.position.y = float(y)
         det_msg.bbox.center.position.z = float(z)
@@ -1461,7 +1668,7 @@ class ImageObstacleDetectionNode(Node):
             det_msg.bbox.center.orientation = quat
         det_msg.bbox.size.x = float(size_x)  # Width
         det_msg.bbox.size.y = float(size_y)  # Height
-        det_msg.bbox.size.z = float(size_z) # Depth approximation
+        det_msg.bbox.size.z = float(size_z)  # Depth approximation
 
         hypothesis = ObjectHypothesisWithPose()
         hypothesis.hypothesis.class_id = class_id
@@ -1508,6 +1715,30 @@ class ImageObstacleDetectionNode(Node):
         marker.lifetime = rclpy.duration.Duration(seconds=0.5).to_msg()  # 0.1 todo: set as a parameter
         return marker
 
+    def lookup_transform(self, source_frame_id, target_frame_id, timestamp=None):
+        if timestamp is None:
+            timestamp = rclpy.time.Time()
+
+        # Try to get the transform from camera to robot
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                    target_frame_id,
+                    source_frame_id,
+                    # this could also be the depth msg timestamp. use "rclpy.time.Time()" to get the latest
+                    timestamp,
+                    rclpy.duration.Duration(seconds=self.transform_timeout)
+            )
+        except tf2_ros.LookupException as e:
+            self.get_logger().error(f"TF Lookup Error: {str(e)}")
+            return None
+        except tf2_ros.ConnectivityException as e:
+            self.get_logger().error(f"TF Connectivity Error: {str(e)}")
+            return None
+        except tf2_ros.ExtrapolationException as e:
+            self.get_logger().error(f"TF Extrapolation Error: {str(e)}")
+            return None
+        return transform
+
     def get_camera_to_robot_tf(self, source_frame_id, timestamp=None):
         if self.camera_to_robot_tf is not None and self.static_camera_to_robot_tf:
             return
@@ -1515,28 +1746,14 @@ class ImageObstacleDetectionNode(Node):
         if timestamp is None:
             timestamp = rclpy.time.Time()
         if self.output_frame:
-            # Try to get the transform from camera to robot
-            try:
-                transform = self.tf_buffer.lookup_transform(
-                    self.output_frame,
-                    source_frame_id,
-                    timestamp,  # this could also be the depth msg timestamp
-                    rclpy.duration.Duration(seconds=self.transform_timeout)
-                )
-            except tf2_ros.LookupException as e:
-                self.get_logger().error(f"TF Lookup Error: {str(e)}")
-                return
-            except tf2_ros.ConnectivityException as e:
-                self.get_logger().error(f"TF Connectivity Error: {str(e)}")
-                return
-            except tf2_ros.ExtrapolationException as e:
-                self.get_logger().error(f"TF Extrapolation Error: {str(e)}")
-                return
+            transform = self.lookup_transform(source_frame_id, self.output_frame, timestamp)
 
             # Convert the TF transform to a 4x4 transformation matrix
-            self.camera_to_robot_tf = self.transform_to_matrix(transform)
-            self.camera_to_robot_tf_o3d = o3c.Tensor(self.camera_to_robot_tf,
-                                                     dtype=o3c.float32, device=self.o3d_device)
+            if transform is not None:
+                self.camera_to_robot_tf = self.transform_to_matrix(transform)
+                if self.use_pointcloud:
+                    self.camera_to_robot_tf_o3d = o3c.Tensor(self.camera_to_robot_tf,
+                                                             dtype=o3c.float32, device=self.o3d_device)
             return
 
     def transform_to_matrix(self, transform: TransformStamped):
@@ -1559,7 +1776,7 @@ class ImageObstacleDetectionNode(Node):
         # transform the size
         object_size_camera_frame = np.array([size_x, size_y, size_z, 1])
         object_size_robot_frame = np.dot(self.camera_to_robot_tf, object_size_camera_frame)
-        size_x_robot, size_y_robot, size_z_robot = object_pose_robot_frame[:3]
+        size_x_robot, size_y_robot, size_z_robot = object_size_robot_frame[:3]
 
         # transform the points
         points_3d_homogenous_camera_frame = np.hstack([points_3d, np.ones((points_3d.shape[0], 1))])
@@ -1573,7 +1790,7 @@ class ImageObstacleDetectionNode(Node):
             input_array = o3c.Tensor(input_array, device=self.o3d_device)
 
         if isinstance(input_array, torch.Tensor):
-            input_array = o3c.Tensor.from_dlpack(torch.utils.dlpack.to_dlpack(input_array))
+            input_array = o3c.Tensor.from_dlpack(torch.utils.dlpack.to_dlpack(input_array)).to(device=self.o3d_device)
 
         return input_array
 
@@ -1585,7 +1802,7 @@ class ImageObstacleDetectionNode(Node):
         :param dtype: Either cv2.CV_32F or cv2.CV_8UC1
         :return:
         """
-        if self.use_gpu or (self.cpu_backend == 'torch'):
+        if self.use_gpu or (not self.use_gpu):
             if dtype is None:
                 dtype = torch.uint8
                 if max_val == 1:
@@ -1631,14 +1848,159 @@ class ImageObstacleDetectionNode(Node):
 
             xy = [(p[0][0], p[0][1]) for p in resized_mask]
 
+    def parameter_change_callback(self, params):
+        """
+        Todo:
+            * change topics (input/output) and destroy subscribers/publishers
+        Triggered whenever there is a change request for one or more parameters.
+
+        Args:
+            params (List[Parameter]): A list of Parameter objects representing the parameters that are
+                being attempted to change.
+
+        Returns:
+            SetParametersResult: Object indicating whether the change was successful.
+        """
+        result = SetParametersResult()
+        result.successful = True
+
+        # Iterate over each parameter in this node
+        for param in params:
+            if param.name == 'publish_debug_image' and param.type_ == Parameter.Type.BOOL:
+                self.publish_debug_image = param.value
+            elif param.name == 'model_path' and param.type_ == Parameter.Type.STRING:
+                self.model_path = param.value
+                # todo: load the model
+            elif param.name == 'track_2d' and param.type_ == Parameter.Type.BOOL:
+                self.track_2d = param.value
+            elif param.name == 'tracker_2d.path' and param.type_ == Parameter.Type.STRING:
+                self.tracker_2d_cfg['path'] = param.value
+            # todo: add other tracker params
+            elif param.name == 'plot_tracks' and param.type_ == Parameter.Type.BOOL:
+                self.plot_tracks = param.value
+            elif param.name == 'use_gpu' and param.type_ == Parameter.Type.BOOL:
+                self.use_gpu = False
+
+                # Then check GPU availability if use_gpu
+                use_gpu = param.value
+                self.device = 'cpu'
+                self.torch_device = torch.device('cpu')
+                if use_gpu:
+                    if torch.cuda.is_available():
+                        self.device = 'cuda:0'
+                        self.torch_device = torch.device('cuda:0')
+                        self.use_gpu = True
+                    else:
+                        self.use_gpu = False
+                        result.successful = False
+                        result.reason = "Torch was not installed/built with CUDA support. GPU backend cannot use torch functions."
+                        self.get_logger().warn("Torch was not installed/built with CUDA support. "
+                                               "GPU backend cannot use torch functions.")
+                self.inference_dict['device'] = self.device
+            elif param.name == 'show_image' and param.type_ == Parameter.Type.BOOL:
+                self.show_image = param.value
+                if not self.show_image:
+                    cv2.destroyAllWindows()
+            elif param.name == 'use_image_dimensions' and param.type_ == Parameter.Type.BOOL:
+                self.use_image_dimensions = param.value
+            elif param.name == 'image_dimensions' and param.type_ == Parameter.Type.INTEGER_ARRAY:
+                self.image_dimensions = param.value
+            elif param.name == 'resize_image' and param.type_ == Parameter.Type.BOOL:
+                self.resize_image = param.value
+            elif param.name == 'half_precision' and param.type_ == Parameter.Type.BOOL:
+                self.half_precision = param.value
+                self.inference_dict['half'] = self.half_precision
+            elif param.name == 'conf_thresh' and param.type_ == Parameter.Type.DOUBLE:
+                self.conf_thresh = param.value
+                self.inference_dict['conf'] = self.conf_thresh
+            elif param.name == 'iou_thresh' and param.type_ == Parameter.Type.DOUBLE:
+                self.iou_thresh = param.value
+                self.inference_dict['iou'] = self.iou_thresh
+            elif param.name == 'max_det' and param.type_ == Parameter.Type.INTEGER:
+                self.max_det = param.value
+                self.inference_dict['max_det'] = self.max_det
+            elif param.name == 'classes' and param.type_ in (Parameter.Type.STRING_ARRAY, Parameter.Type.INTEGER_ARRAY):
+                classes = param.value
+                if param.type_ == Parameter.Type.STRING_ARRAY:
+                    assert all(x in self.supported_class_names for x in classes)
+                    self.classes = [self.class_names_inv[x.strip()] for x in classes]
+                else:
+                    assert all(x in self.supported_class_keys for x in classes)
+                    self.classes = classes
+                self.inference_dict['classes'] = self.classes
+            elif param.name == 'update_class' and param.type_ == Parameter.Type.STRING:
+                # Update the list of classes based on the update_class parameter.
+                # For CLI, add -- before -class,
+                # e.g ros2 param set /single_stream_detector update_class -- -truck.
+                self.update_class = param.value
+                mode = "add"
+                cls = self.update_class
+                if self.update_class.startswith('-'):
+                    mode = "remove"
+                    cls = self.update_class[1:]
+                # check if the class name is supported
+                if cls not in self.supported_class_names:
+                    result.successful = False
+                    result.reason = f"'{cls}' is not a supported class name."
+                    self.get_logger().warn(f"'{cls}' is not a supported class name.")
+                # get the class key
+                cls_key = self.class_names_inv.get(cls.strip(), False)
+                # add or remove the class
+                if (mode == "add") and (cls_key not in self.classes):
+                    self.classes.append(cls_key)
+                    print(f"Added '{cls}' to the list of classes.")
+                elif (mode == "remove") and cls_key:
+                    self.classes.remove(cls_key)
+                    print(f"Removed '{cls}' from the list of classes.")
+                self.inference_dict['classes'] = self.classes
+                # update the classes parameter
+                self.set_parameters(
+                        [
+                            rclpy.parameter.Parameter(
+                                'classes',
+                                Parameter.Type.STRING_ARRAY,
+                                [self.class_names[x] for x in self.classes]
+                            )
+                        ]
+                )
+            elif param.name == 'agnostic_nms' and param.type_ == Parameter.Type.BOOL:
+                self.agnostic_nms = param.value
+                self.inference_dict['agnostic_nms'] = self.agnostic_nms
+            elif param.name == 'augment' and param.type_ == Parameter.Type.BOOL:
+                self.augment = param.value
+                self.inference_dict['augment'] = self.augment
+            elif param.name == 'verbose' and param.type_ == Parameter.Type.BOOL:
+                self.verbose = param.value
+                os.environ['YOLO_VERBOSE'] = str(self.verbose)
+                self.inference_dict['verbose'] = self.verbose
+            elif param.name == 'static_camera_info' and param.type_ == Parameter.Type.BOOL:
+                self.static_camera_info = param.value
+            else:
+                result.successful = False
+            self.get_logger().info(f"Success = {result.successful} for param {param.name} to value {param.value}")
+        return result
+
     def destroy_node(self):
+        # close OpenCV windows
         cv2.destroyAllWindows()
+        # the reference to the model
         del self.model
-        if self.project_to_3d and self.use_pointcloud:
-            del self.o3d_pointcloud
+        # clear the cuda cache
         if "cuda" in self.device:
             self.get_logger().info("Clearing CUDA cache")
             torch.cuda.empty_cache()
+        # close the temporary file used for the custom tracker settings
+        if self.track_2d:
+            try:
+                self.temp_file.close()
+            except FileNotFoundError:
+                pass
+        # delete the open3d pointlcoud object cleanly
+        if self.project_to_3d and self.use_pointcloud:
+            self.pointcloud_preprocessor.o3d_pointcloud.clear()
+            self.o3d_pointcloud.clear()
+            del self.o3d_pointcloud, self.pointcloud_preprocessor.o3d_pointcloud
+        return None
 
 
 def main(args=None):
@@ -1646,7 +2008,7 @@ def main(args=None):
     node = ImageObstacleDetectionNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException, SystemExit):
         node.get_logger().info("Shutting down node...")
     finally:
         node.destroy_node()
