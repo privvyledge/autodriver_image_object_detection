@@ -2,6 +2,7 @@ import numpy as np
 import rclpy
 import cv2
 import torch
+from rclpy.executors import MultiThreadedExecutor
 from cv_bridge import CvBridge
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
@@ -51,8 +52,10 @@ class TrackingNode(BaseDetector):
         qos_profile = self._build_qos_profile()
 
         # Subscribers
-        self.image_sub = Subscriber(self, Image, "image_raw", qos_profile=qos_profile)
-        self.detections_sub = Subscriber(self, Detection2DArray, "detections_2d", qos_profile=qos_profile)
+        self.image_sub = Subscriber(self, Image, "image_raw", qos_profile=qos_profile,
+                                    callback_group=self._sub_cb_group)
+        self.detections_sub = Subscriber(self, Detection2DArray, "detections_2d", qos_profile=qos_profile,
+                                         callback_group=self._sub_cb_group)
 
         self.ts = ApproximateTimeSynchronizer((self.image_sub, self.detections_sub), self.queue_size, slop=self.synchronization_interval)
         self.ts.registerCallback(self.detection_callback)
@@ -166,7 +169,9 @@ def main(args=None):
     rclpy.init(args=args)
     node = TrackingNode()
     try:
-        rclpy.spin(node)
+        executor = MultiThreadedExecutor(num_threads=4)
+        executor.add_node(node)
+        executor.spin()
     except (KeyboardInterrupt, SystemExit):
         node.get_logger().info('Shutting down...')
     finally:

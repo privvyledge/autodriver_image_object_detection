@@ -1,7 +1,6 @@
 """Depth fusion node: lift Detection2DArray to 3D using depth images or LiDAR pointclouds."""
 import numpy as np
 import torch
-import torch.utils.dlpack
 
 try:
     from tf_transformations import quaternion_matrix, quaternion_from_matrix
@@ -19,7 +18,7 @@ except ImportError:
 import rclpy
 import rclpy.duration
 import rclpy.time
-from rclpy.executors import ExternalShutdownException
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 from cv_bridge import CvBridge
 from message_filters import Subscriber, TimeSynchronizer, ApproximateTimeSynchronizer
@@ -33,7 +32,7 @@ from tf2_ros import TransformListener, Buffer
 
 from autodriver_image_object_detection.base_detector import BaseDetector
 from autodriver_image_object_detection.utils.pointcloud_utils import (
-    unpack_pointcloud_message, create_marker,
+    unpack_pointcloud_message, create_marker, project_depth_to_3d,
 )
 
 
@@ -164,18 +163,21 @@ class DepthFusionNode(BaseDetector):
         self._pc_idx = None
 
         self._det_sub = Subscriber(
-            self, Detection2DArray, self.detections_2d_topic, qos_profile=qos_profile)
+            self, Detection2DArray, self.detections_2d_topic, qos_profile=qos_profile,
+            callback_group=self._sub_cb_group)
         self._subs.append(self._det_sub)
 
         if self.use_depth:
             self._depth_sub = Subscriber(
-                self, Image, self.depth_image_topic, qos_profile=qos_profile)
+                self, Image, self.depth_image_topic, qos_profile=qos_profile,
+                callback_group=self._sub_cb_group)
             self._depth_idx = len(self._subs)
             self._subs.append(self._depth_sub)
 
         if self.use_pointcloud:
             self._pc_sub = Subscriber(
-                self, PointCloud2, self.pointcloud_topic, qos_profile=qos_profile)
+                self, PointCloud2, self.pointcloud_topic, qos_profile=qos_profile,
+                callback_group=self._sub_cb_group)
             self._pc_idx = len(self._subs)
             self._subs.append(self._pc_sub)
 
@@ -192,10 +194,12 @@ class DepthFusionNode(BaseDetector):
 
         # camera infos are not in the sync group (low-frequency, effectively latched)
         self.create_subscription(CameraInfo, self.rgb_camera_info_topic,
-                                  self._rgb_camera_info_cb, qos_profile)
+                                  self._rgb_camera_info_cb, qos_profile,
+                                  callback_group=self._sub_cb_group)
         if self.use_depth:
             self.create_subscription(CameraInfo, self.depth_camera_info_topic,
-                                      self._depth_camera_info_cb, qos_profile)
+                                      self._depth_camera_info_cb, qos_profile,
+                                      callback_group=self._sub_cb_group)
 
         # ---------------------------------------------------------------- publishers
         if self.use_depth:
@@ -288,21 +292,26 @@ class DepthFusionNode(BaseDetector):
         det3d_arr.header.stamp = timestamp
         marker_arr = MarkerArray()
 
+        depth_image[depth_image > self.depth_max * self.depth_scale] = 0.0
+        rfx = self.rgb_camera_model.fx()
+        rfy = self.rgb_camera_model.fy()
         for i, det in enumerate(detections_msg.detections):
             bbox = (det.bbox.center.position.x, det.bbox.center.position.y,
                     det.bbox.size_x, det.bbox.size_y)
             conf = det.results[0].hypothesis.score if det.results else 0.0
             cls_name = det.results[0].hypothesis.class_id if det.results else ''
 
-            result = self._project_depth(bbox, depth_image)
-            if result is None:
+            xyz = project_depth_to_3d(bbox, depth_image, self.rgb_camera_model, self.depth_scale)
+            if xyz is None:
                 continue
-            x3, y3, z3, sx, sy, sz = result
+            x3, y3, z3 = xyz
+            sx = z3 * int(bbox[2]) / rfx
+            sy = z3 * int(bbox[3]) / rfy
 
             det3d_arr.detections.append(
-                self._make_detection3d(x3, y3, z3, sx, sy, sz, conf, cls_name, frame_id))
+                self._make_detection3d(x3, y3, z3, sx, sy, 0.0, conf, cls_name, frame_id))
             marker_arr.markers.append(
-                create_marker(i, x3, y3, z3, sx, sy, sz, frame_id,
+                create_marker(i, x3, y3, z3, sx, sy, 0.0, frame_id,
                               timestamp=timestamp, rgba=[1.0, 0.0, 0.0, 0.5]))
 
         self.detection3d_depth_pub.publish(det3d_arr)
@@ -319,52 +328,6 @@ class DepthFusionNode(BaseDetector):
             self._depth_to_rgb_tf = self._transform_to_matrix(transform)
             self._depth_to_rgb_tf_torch = torch.as_tensor(
                 self._depth_to_rgb_tf, dtype=torch.float32, device=self.torch_device)
-
-    def _project_depth(self, xywh, depth_image):
-        """Back-project a 2D bbox into 3D using a depth image.
-
-        Returns (x, y, z, size_x, size_y, size_z) in depth camera frame, or None.
-        """
-        cx_b, cy_b = int(xywh[0]), int(xywh[1])
-        w_b, h_b = int(xywh[2]), int(xywh[3])
-        H, W = depth_image.shape[:2]
-
-        u0 = max(cx_b - w_b // 2, 0)
-        u1 = min(cx_b + w_b // 2, W - 1)
-        v0 = max(cy_b - h_b // 2, 0)
-        v1 = min(cy_b + h_b // 2, H - 1)
-        if u1 <= u0 or v1 <= v0:
-            return None
-
-        roi = depth_image[v0:v1, u0:u1] / self.depth_scale
-        if not np.any(roi):
-            return None
-
-        # centre pixel depth as reference, filter by depth_max
-        cx_b_c = max(0, min(cx_b, W - 1))
-        cy_b_c = max(0, min(cy_b, H - 1))
-        z_ref = float(depth_image[cy_b_c, cx_b_c]) / self.depth_scale
-        mask_z = (roi > 0) & (np.abs(roi - z_ref) <= self.depth_max)
-        if not np.any(mask_z):
-            return None
-
-        roi_filt = roi[mask_z]
-        z_min_v, z_max_v = float(np.min(roi_filt)), float(np.max(roi_filt))
-        z = (z_min_v + z_max_v) / 2.0
-        if z == 0.0:
-            return None
-
-        dcx = self.depth_camera_model.cx()
-        dcy = self.depth_camera_model.cy()
-        dfx = self.depth_camera_model.fx()
-        dfy = self.depth_camera_model.fy()
-
-        x = z * (cx_b - dcx) / dfx
-        y = z * (cy_b - dcy) / dfy
-        size_x = z * (w_b / dfx)
-        size_y = z * (h_b / dfy)
-        size_z = float(z_max_v - z_min_v)
-        return x, y, z, size_x, size_y, size_z
 
     @staticmethod
     def _align_depth_to_rgb(depth_map, K_depth, K_rgb, T_depth_to_rgb, rgb_shape, depth_scale=1.0):
@@ -434,13 +397,18 @@ class DepthFusionNode(BaseDetector):
         det3d_arr.header.stamp = timestamp
         marker_arr = MarkerArray()
 
+        if self._pc_to_rgb_tf_o3d is not None:
+            pts_rgb = self.o3d_pointcloud.clone().transform(self._pc_to_rgb_tf_o3d).point.positions
+        else:
+            pts_rgb = self.o3d_pointcloud.point.positions
+
         for i, det in enumerate(detections_msg.detections):
             bbox = (det.bbox.center.position.x, det.bbox.center.position.y,
                     det.bbox.size_x, det.bbox.size_y)
             conf = det.results[0].hypothesis.score if det.results else 0.0
             cls_name = det.results[0].hypothesis.class_id if det.results else ''
 
-            result = self._project_pointcloud(bbox)
+            result = self._project_pointcloud(bbox, pts_rgb)
             if result is None:
                 continue
             x3, y3, z3, sx, sy, sz, quat = result
@@ -486,7 +454,7 @@ class DepthFusionNode(BaseDetector):
             self._pc_to_rgb_tf_o3d = o3c.Tensor(
                 self._pc_to_rgb_tf, dtype=o3c.float32, device=self.o3d_device)
 
-    def _project_pointcloud(self, xywh):
+    def _project_pointcloud(self, xywh, pts_rgb):
         """Filter 3D points inside a 2D bbox, cluster, and return the dominant cluster.
 
         Returns (x, y, z, size_x, size_y, size_z, quat) or None.
@@ -503,19 +471,14 @@ class DepthFusionNode(BaseDetector):
         img_w = self.rgb_camera_model.width
         img_h = self.rgb_camera_model.height
 
-        # transform pointcloud to RGB camera frame for 2D projection
-        if self._pc_to_rgb_tf_o3d is not None:
-            pts = self.o3d_pointcloud.clone().transform(self._pc_to_rgb_tf_o3d).point.positions
-        else:
-            pts = self.o3d_pointcloud.point.positions.clone()
+        x_ = pts_rgb[:, 0]
+        y_ = pts_rgb[:, 1]
+        z_ = pts_rgb[:, 2]
 
-        x_ = pts[:, 0]
-        y_ = pts[:, 1]
-        z_ = pts[:, 2]
-
-        # project to 2D
-        x_2d = (x_ * rfx / z_) + rcx
-        y_2d = (y_ * rfy / z_) + rcy
+        mask_fwd = (z_ > 0).to(o3c.float32)
+        z_denom = z_ * mask_fwd + (1.0 - mask_fwd)
+        x_2d = (x_ * rfx / z_denom) + rcx
+        y_2d = (y_ * rfy / z_denom) + rcy
 
         # filter: within image FOV, within bbox, in front of camera
         x1 = bbox_cx - bbox_w // 2
@@ -554,21 +517,19 @@ class DepthFusionNode(BaseDetector):
             min_points=self.min_cluster_size,
             print_progress=False,
         )
-        labels_t = torch.utils.dlpack.from_dlpack(labels.to_dlpack())
-        unique, counts = torch.unique(labels_t[labels_t != -1], return_counts=True)
-        if len(unique) == 0:
+        labels_np = labels.to(o3c.Device('CPU:0')).numpy()
+        valid = labels_np >= 0
+        if not valid.any():
             return [], [], [], [], []
-
-        # sort by cluster size descending so callers get the largest cluster first
-        order = torch.argsort(counts, descending=True)
-        unique = unique[order]
+        unique_labels, counts = np.unique(labels_np[valid], return_counts=True)
+        order = np.argsort(-counts)
+        unique_labels = unique_labels[order]
 
         clusters, bboxes, centers, extents, quats = [], [], [], [], []
-        for label in unique:
-            mask_bool = (labels_t == label).to(dtype=torch.uint8).contiguous()
-            mask_o3d = o3c.Tensor.from_dlpack(
-                torch.utils.dlpack.to_dlpack(mask_bool)).to(o3c.Dtype.Bool)
-            cluster = o3d_pcd.select_by_mask(mask_o3d)
+        for label in unique_labels:
+            indices = np.where(labels_np == label)[0].astype(np.int64)
+            cluster = o3d_pcd.select_by_index(
+                o3c.Tensor(indices, dtype=o3c.int64, device=self.o3d_device))
             if cluster.is_empty():
                 continue
 
@@ -665,7 +626,9 @@ def main(args=None):
     rclpy.init(args=args)
     node = DepthFusionNode()
     try:
-        rclpy.spin(node)
+        executor = MultiThreadedExecutor(num_threads=4)
+        executor.add_node(node)
+        executor.spin()
     except (KeyboardInterrupt, ExternalShutdownException, SystemExit):
         node.get_logger().info('Shutting down...')
     finally:

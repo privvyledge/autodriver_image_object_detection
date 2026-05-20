@@ -1,9 +1,11 @@
 """Single stream detector for object detection with optional tracking."""
 import os
+import queue
+import threading
 
 import cv2
 import rclpy
-from rclpy.executors import ExternalShutdownException
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.parameter import Parameter
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType, SetParametersResult
 from sensor_msgs.msg import Image, CompressedImage, CameraInfo
@@ -80,9 +82,11 @@ class SingleStreamDetector(BaseDetector):
 
         # Subscribers
         self.image_sub = self.create_subscription(
-            self.image_message_type, self.input_image_topic, self.image_callback, qos_profile)
+            self.image_message_type, self.input_image_topic, self.image_callback, qos_profile,
+            callback_group=self._sub_cb_group)
         self.camera_info_sub = self.create_subscription(
-            CameraInfo, self.input_camera_info_topic, self.camera_info_callback, qos_profile)
+            CameraInfo, self.input_camera_info_topic, self.camera_info_callback, qos_profile,
+            callback_group=self._sub_cb_group)
 
         # Publishers
         self.detection_results_pub = self.create_publisher(
@@ -104,6 +108,10 @@ class SingleStreamDetector(BaseDetector):
 
         self.add_on_set_parameters_callback(self.parameter_change_callback)
 
+        self._image_queue = queue.Queue(maxsize=2)
+        self._inference_thread = threading.Thread(target=self._inference_worker, daemon=True)
+        self._inference_thread.start()
+
         self.get_logger().info(
             f'single_stream_detector started. '
             f'Subscribing to {self.input_image_topic}. '
@@ -113,85 +121,100 @@ class SingleStreamDetector(BaseDetector):
     # ---------------------------------------------------------------- callbacks
 
     def image_callback(self, msg):
-        if self.camera_info is None:
-            self.get_logger().warn('No CameraInfo received yet — skipping frame.', once=True)
-            return
+        if self._image_queue.full():
+            try:
+                self._image_queue.get_nowait()
+            except queue.Empty:
+                pass
         try:
-            (cv_image, msg_encoding, image_frame_id, msg_timestamp, msg_fmt,
-             conversion, inverse_conversion, is_color, is_depth,
-             compressed_msg_codec) = parse_image_message(
-                msg, self.bridge, self.image_message_format, logger=self.get_logger())
+            self._image_queue.put_nowait(msg)
+        except queue.Full:
+            pass
 
-            # Lazy imgsz init from first frame
-            if self.imgsz is None:
-                self.image_height, self.image_width = cv_image.shape[:2]
-                if self.use_image_dimensions:
-                    new_h = (self.image_height if self.image_height % 32 == 0
-                             else ((self.image_height // 32) + 1) * 32)
-                    new_w = (self.image_width if self.image_width % 32 == 0
-                             else ((self.image_width // 32) + 1) * 32)
-                    self.imgsz = (new_h, new_w)
-                    self.get_logger().info(f'Using image dimensions: {self.imgsz}')
-                else:
-                    self.imgsz = list(self.image_dimensions)
-            self.inference_dict['imgsz'] = self.imgsz
+    def _inference_worker(self):
+        while rclpy.ok():
+            try:
+                msg = self._image_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if self.camera_info is None:
+                self.get_logger().warn('No CameraInfo received yet — skipping frame.', once=True)
+                continue
+            try:
+                (cv_image, msg_encoding, image_frame_id, msg_timestamp, msg_fmt,
+                 conversion, inverse_conversion, is_color, is_depth,
+                 compressed_msg_codec) = parse_image_message(
+                    msg, self.bridge, self.image_message_format, logger=self.get_logger())
 
-            if (self.resize_image and self.use_image_dimensions
-                    and (self.image_height, self.image_width) != (self.imgsz[0], self.imgsz[1])):
-                cv_image = cv2.resize(cv_image, (self.imgsz[1], self.imgsz[0]))
-
-            self.detect_objects(cv_image)
-            detection_msg, detection_image, mask_img = self.parse_results(self.results, msg.header)
-
-            if detection_msg is None:
-                return
-            self.detection_results_pub.publish(detection_msg)
-
-            if detection_image is not None and self.publish_debug_image:
-                if conversion is not None:
-                    detection_image = cv2.cvtColor(detection_image, inverse_conversion)
-
-                if self.image_message_format in ('compressed', 'packet'):
-                    det_img_msg = self.bridge.cv2_to_compressed_imgmsg(
-                        detection_image, dst_format=compressed_msg_codec)
-                else:
-                    det_img_msg = self.bridge.cv2_to_imgmsg(detection_image, encoding=msg_fmt)
-                det_img_msg.header.frame_id = image_frame_id
-                det_img_msg.header.stamp = msg_timestamp
-
-                if self.detection_image_topic:
-                    self.detection_image_pub.publish(det_img_msg)
-
-                if self.segmentation_mask_image_topic and mask_img is not None:
-                    if self.image_message_format in ('compressed', 'packet'):
-                        mask_msg = self.bridge.cv2_to_compressed_imgmsg(
-                            mask_img, dst_format=compressed_msg_codec)
+                if self.imgsz is None:
+                    self.image_height, self.image_width = cv_image.shape[:2]
+                    if self.use_image_dimensions:
+                        new_h = (self.image_height if self.image_height % 32 == 0
+                                 else ((self.image_height // 32) + 1) * 32)
+                        new_w = (self.image_width if self.image_width % 32 == 0
+                                 else ((self.image_width // 32) + 1) * 32)
+                        self.imgsz = (new_h, new_w)
+                        self.get_logger().info(f'Using image dimensions: {self.imgsz}')
                     else:
-                        mask_msg = self.bridge.cv2_to_imgmsg(mask_img, encoding='mono8')
-                    mask_msg.header.frame_id = image_frame_id
-                    mask_msg.header.stamp = msg_timestamp
-                    self.segmentation_mask_image_pub.publish(mask_msg)
+                        self.imgsz = list(self.image_dimensions)
+                self.inference_dict['imgsz'] = self.imgsz
 
-                if self.segmentation_image_topic and mask_img is not None:
-                    cv_image_inv = cv_image
-                    if inverse_conversion is not None:
-                        cv_image_inv = cv2.cvtColor(cv_image, inverse_conversion)
-                    color_mask = cv2.bitwise_and(cv_image_inv, cv_image_inv, mask=mask_img)
-                    if self.show_image:
-                        cv2.imshow('color_mask_image', color_mask)
-                        cv2.waitKey(1)
+                if (self.resize_image and self.use_image_dimensions
+                        and (self.image_height, self.image_width) != (self.imgsz[0], self.imgsz[1])):
+                    cv_image = cv2.resize(cv_image, (self.imgsz[1], self.imgsz[0]))
+
+                self.detect_objects(cv_image)
+                detection_msg, detection_image, mask_img = self.parse_results(self.results, msg.header)
+
+                if detection_msg is None:
+                    continue
+                self.detection_results_pub.publish(detection_msg)
+
+                if detection_image is not None and self.publish_debug_image:
+                    if conversion is not None:
+                        detection_image = cv2.cvtColor(detection_image, inverse_conversion)
 
                     if self.image_message_format in ('compressed', 'packet'):
-                        cmask_msg = self.bridge.cv2_to_compressed_imgmsg(
-                            color_mask, dst_format=compressed_msg_codec)
+                        det_img_msg = self.bridge.cv2_to_compressed_imgmsg(
+                            detection_image, dst_format=compressed_msg_codec)
                     else:
-                        cmask_msg = self.bridge.cv2_to_imgmsg(color_mask, encoding=msg_fmt)
-                    cmask_msg.header.frame_id = image_frame_id
-                    cmask_msg.header.stamp = msg_timestamp
-                    self.segmentation_image_pub.publish(cmask_msg)
+                        det_img_msg = self.bridge.cv2_to_imgmsg(detection_image, encoding=msg_fmt)
+                    det_img_msg.header.frame_id = image_frame_id
+                    det_img_msg.header.stamp = msg_timestamp
 
-        except Exception as e:
-            self.get_logger().error(f'Error processing image: {e}')
+                    if self.detection_image_topic:
+                        self.detection_image_pub.publish(det_img_msg)
+
+                    if self.segmentation_mask_image_topic and mask_img is not None:
+                        if self.image_message_format in ('compressed', 'packet'):
+                            mask_msg = self.bridge.cv2_to_compressed_imgmsg(
+                                mask_img, dst_format=compressed_msg_codec)
+                        else:
+                            mask_msg = self.bridge.cv2_to_imgmsg(mask_img, encoding='mono8')
+                        mask_msg.header.frame_id = image_frame_id
+                        mask_msg.header.stamp = msg_timestamp
+                        self.segmentation_mask_image_pub.publish(mask_msg)
+
+                    if self.segmentation_image_topic and mask_img is not None:
+                        cv_image_inv = cv_image
+                        if inverse_conversion is not None:
+                            cv_image_inv = cv2.cvtColor(cv_image, inverse_conversion)
+                        color_mask = cv2.bitwise_and(cv_image_inv, cv_image_inv, mask=mask_img)
+                        if self.show_image:
+                            cv2.imshow('color_mask_image', color_mask)
+                            cv2.waitKey(1)
+
+                        if self.image_message_format in ('compressed', 'packet'):
+                            cmask_msg = self.bridge.cv2_to_compressed_imgmsg(
+                                color_mask, dst_format=compressed_msg_codec)
+                        else:
+                            cmask_msg = self.bridge.cv2_to_imgmsg(color_mask, encoding=msg_fmt)
+                        cmask_msg.header.frame_id = image_frame_id
+                        cmask_msg.header.stamp = msg_timestamp
+                        self.segmentation_image_pub.publish(cmask_msg)
+
+            except Exception as e:
+                self.get_logger().error(f'Error processing image: {e}')
 
     def camera_info_callback(self, msg):
         if self.camera_info is None or not self.static_camera_info:
@@ -280,7 +303,9 @@ def main(args=None):
     rclpy.init(args=args)
     node = SingleStreamDetector()
     try:
-        rclpy.spin(node)
+        executor = MultiThreadedExecutor(num_threads=4)
+        executor.add_node(node)
+        executor.spin()
     except (KeyboardInterrupt, ExternalShutdownException, SystemExit):
         node.get_logger().info('Shutting down...')
     finally:

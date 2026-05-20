@@ -1,7 +1,7 @@
 """Multi-stream detector: batch YOLO inference across N cameras with a single model instance."""
 import cv2
 import rclpy
-from rclpy.executors import ExternalShutdownException
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 from message_filters import Subscriber, TimeSynchronizer, ApproximateTimeSynchronizer
 from sensor_msgs.msg import Image, CompressedImage, CameraInfo
@@ -86,21 +86,25 @@ class MultiStreamDetector(BaseDetector):
             self.image_message_types[camera] = msg_type
 
             if self.synchronization_interval >= 0.0:
-                img_sub = Subscriber(self, msg_type, f'{camera}/image_raw', qos_profile=qos_profile)
+                img_sub = Subscriber(self, msg_type, f'{camera}/image_raw', qos_profile=qos_profile,
+                                     callback_group=self._sub_cb_group)
                 self.subscriptions_.append(img_sub)
                 if self.subscribe_camera_info:
                     info_sub = Subscriber(
-                        self, CameraInfo, f'{camera}/camera_info', qos_profile=qos_profile)
+                        self, CameraInfo, f'{camera}/camera_info', qos_profile=qos_profile,
+                        callback_group=self._sub_cb_group)
                     self.subscriptions_.append(info_sub)
             else:
                 self.create_subscription(
                     msg_type, f'{camera}/image_raw',
                     lambda msg, idx=i: self.callback_common(msg, idx),
-                    qos_profile=qos_profile)
+                    qos_profile=qos_profile,
+                    callback_group=self._sub_cb_group)
                 self.create_subscription(
                     CameraInfo, f'{camera}/camera_info',
                     lambda msg, cam=camera: self._store_camera_info(msg, cam),
-                    qos_profile=qos_profile)
+                    qos_profile=qos_profile,
+                    callback_group=self._sub_cb_group)
 
         if self.synchronization_interval >= 0.0:
             if self.synchronization_interval == 0.0:
@@ -251,7 +255,9 @@ def main(args=None):
     rclpy.init(args=args)
     node = MultiStreamDetector()
     try:
-        rclpy.spin(node)
+        executor = MultiThreadedExecutor(num_threads=4)
+        executor.add_node(node)
+        executor.spin()
     except (KeyboardInterrupt, ExternalShutdownException, SystemExit):
         node.get_logger().info('Shutting down...')
     finally:

@@ -13,6 +13,7 @@ import yaml
 from ament_index_python.packages import get_package_share_directory
 from cv_bridge import CvBridge
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType, SetParametersResult
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
@@ -47,6 +48,11 @@ class BaseDetector(Node):
 
     def __init__(self, node_name: str):
         super().__init__(node_name)
+        self._init_callback_groups()
+
+    def _init_callback_groups(self) -> None:
+        self._sub_cb_group = MutuallyExclusiveCallbackGroup()
+        self._param_cb_group = MutuallyExclusiveCallbackGroup()
 
     # ---------------------------------------------------------- param defaults
 
