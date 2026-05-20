@@ -114,7 +114,7 @@ class BaseDetector(Node):
         self.declare_parameter('track_2d', d.get('track_2d', True))
         self.declare_parameter(
             'tracker_2d.path',
-            d.get('tracker_2d.path', os.path.join(pkg, 'config', 'tracker_custom.yaml')),
+            d.get('tracker_2d.path', os.path.join(pkg, 'config', 'tracker_orin_nano.yaml')),
         )
         self.declare_parameter('tracker_2d.tracker_type', d.get('tracker_2d.tracker_type', 'bytetrack'))
         self.declare_parameter('tracker_2d.track_high_thresh', d.get('tracker_2d.track_high_thresh', -1.0))
@@ -329,6 +329,14 @@ class BaseDetector(Node):
             reliability=QoSReliabilityPolicy.RELIABLE,
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=self.queue_size,
+        )
+
+    def _build_sensor_qos_profile(self) -> QoSProfile:
+        """Return BEST_EFFORT/KEEP_LAST/depth=1 — suitable for raw sensor topics."""
+        return QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
         )
 
     # ------------------------------------------------------------ inference

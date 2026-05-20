@@ -67,8 +67,10 @@ class DepthFusionNode(BaseDetector):
         self.declare_parameter('pointcloud_topic', 'carla/ego_vehicle/lidar')
         self.declare_parameter('qos', 'SENSOR_DATA')
         self.declare_parameter('queue_size', 1)
+        self.declare_parameter('fps', 30)
+        _fps = self.get_parameter('fps').get_parameter_value().integer_value
         self.declare_parameter(
-            'synchronization_interval', 0.1,
+            'synchronization_interval', 1.5 / _fps,
             ParameterDescriptor(
                 type=ParameterType.PARAMETER_DOUBLE,
                 description='0: exact sync; >0: approximate sync slop in seconds.',
@@ -102,6 +104,7 @@ class DepthFusionNode(BaseDetector):
         self.pointcloud_topic = gp('pointcloud_topic').value
         self.qos = gp('qos').value
         self.queue_size = gp('queue_size').value
+        self.fps = gp('fps').value
         self.synchronization_interval = gp('synchronization_interval').value
         self.use_gpu = gp('use_gpu').value
         self.use_depth = gp('use_depth').value
@@ -156,6 +159,7 @@ class DepthFusionNode(BaseDetector):
                 self.o3d_pointcloud = o3d.t.geometry.PointCloud(self.o3d_device)
 
         qos_profile = self._build_qos_profile()
+        sensor_qos = self._build_sensor_qos_profile()
 
         # ---------------------------------------------------------------- synchronized subscriptions
         self._subs = []
@@ -169,14 +173,14 @@ class DepthFusionNode(BaseDetector):
 
         if self.use_depth:
             self._depth_sub = Subscriber(
-                self, Image, self.depth_image_topic, qos_profile=qos_profile,
+                self, Image, self.depth_image_topic, qos_profile=sensor_qos,
                 callback_group=self._sub_cb_group)
             self._depth_idx = len(self._subs)
             self._subs.append(self._depth_sub)
 
         if self.use_pointcloud:
             self._pc_sub = Subscriber(
-                self, PointCloud2, self.pointcloud_topic, qos_profile=qos_profile,
+                self, PointCloud2, self.pointcloud_topic, qos_profile=sensor_qos,
                 callback_group=self._sub_cb_group)
             self._pc_idx = len(self._subs)
             self._subs.append(self._pc_sub)
@@ -204,14 +208,14 @@ class DepthFusionNode(BaseDetector):
         # ---------------------------------------------------------------- publishers
         if self.use_depth:
             self.detection3d_depth_pub = self.create_publisher(
-                Detection3DArray, 'depth_fusion/detection3d_depth', qos_profile)
+                Detection3DArray, 'depth_fusion/detection3d_depth', self.queue_size)
             self.marker_depth_pub = self.create_publisher(
-                MarkerArray, 'depth_fusion/markers_depth', qos_profile)
+                MarkerArray, 'depth_fusion/markers_depth', self.queue_size)
         if self.use_pointcloud:
             self.detection3d_pc_pub = self.create_publisher(
-                Detection3DArray, 'depth_fusion/detection3d_pointcloud', qos_profile)
+                Detection3DArray, 'depth_fusion/detection3d_pointcloud', self.queue_size)
             self.marker_pc_pub = self.create_publisher(
-                MarkerArray, 'depth_fusion/markers_pointcloud', qos_profile)
+                MarkerArray, 'depth_fusion/markers_pointcloud', self.queue_size)
 
         self.get_logger().info(
             f'depth_fusion_node started. '

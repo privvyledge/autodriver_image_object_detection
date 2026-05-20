@@ -1,0 +1,17 @@
+# Jetson Orin Nano — tuned for minimal CPU/memory usage (primary deployment target)
+# Ref: https://github.com/ultralytics/ultralytics/issues/4473
+tracker_type: bytetrack
+track_high_thresh: 0.30  # raised: fewer spurious tracks at limited compute
+track_low_thresh: 0.10
+new_track_thresh: 0.35
+track_buffer: 30          # 1 s @ 30 fps (vs 2 s default)
+match_thresh: 0.75        # stricter IoU: fewer ID switches
+fuse_score: True
+# min_box_area: 10
+
+# BoT-SORT settings (unused for bytetrack; kept for drop-in BoTSORT switch)
+gmc_method: None          # disabled: saves ~35% CPU vs sparseOptFlow
+proximity_thresh: 0.5
+appearance_thresh: 0.8
+with_reid: False
+model: auto

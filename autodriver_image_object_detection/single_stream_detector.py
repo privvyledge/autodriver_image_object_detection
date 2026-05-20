@@ -79,10 +79,11 @@ class SingleStreamDetector(BaseDetector):
             self.image_message_type = CompressedImage
 
         qos_profile = self._build_qos_profile()
+        sensor_qos = self._build_sensor_qos_profile()
 
         # Subscribers
         self.image_sub = self.create_subscription(
-            self.image_message_type, self.input_image_topic, self.image_callback, qos_profile,
+            self.image_message_type, self.input_image_topic, self.image_callback, sensor_qos,
             callback_group=self._sub_cb_group)
         self.camera_info_sub = self.create_subscription(
             CameraInfo, self.input_camera_info_topic, self.camera_info_callback, qos_profile,
@@ -94,7 +95,7 @@ class SingleStreamDetector(BaseDetector):
         self.object_array_pub = self.create_publisher(ObjectArray, 'yolo/objects', self.queue_size)
         try:
             self.obstacle_detection_pub = self.create_publisher(
-                ObstacleArray, 'yolo/obstacles', qos_profile)
+                ObstacleArray, 'yolo/obstacles', self.queue_size)
         except NameError:
             self.obstacle_detection_pub = None
 

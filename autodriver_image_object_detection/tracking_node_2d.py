@@ -24,8 +24,9 @@ class TrackingNode(BaseDetector):
 
         self.declare_parameter('tracker_2d', 'bytetrack.yaml')
         self.declare_parameter('fps', 30)
+        _fps = self.get_parameter('fps').get_parameter_value().integer_value
         self.declare_parameter('queue_size', 10)
-        self.declare_parameter('synchronization_interval', 0.1)
+        self.declare_parameter('synchronization_interval', 1.5 / _fps)
         self.declare_parameter('use_gpu', True)
         self.declare_parameter('show_image', False,
                                ParameterDescriptor(type=ParameterType.PARAMETER_BOOL))
@@ -50,9 +51,10 @@ class TrackingNode(BaseDetector):
         self.bridge = CvBridge()
 
         qos_profile = self._build_qos_profile()
+        sensor_qos = self._build_sensor_qos_profile()
 
         # Subscribers
-        self.image_sub = Subscriber(self, Image, "image_raw", qos_profile=qos_profile,
+        self.image_sub = Subscriber(self, Image, "image_raw", qos_profile=sensor_qos,
                                     callback_group=self._sub_cb_group)
         self.detections_sub = Subscriber(self, Detection2DArray, "detections_2d", qos_profile=qos_profile,
                                          callback_group=self._sub_cb_group)

@@ -1,0 +1,17 @@
+# Desktop GPU (RTX 3070 / RTX 4090) — relaxed thresholds for development/testing
+# Ref: https://github.com/ultralytics/ultralytics/issues/4473
+tracker_type: bytetrack
+track_high_thresh: 0.25
+track_low_thresh: 0.10
+new_track_thresh: 0.25
+track_buffer: 90          # 3 s @ 30 fps
+match_thresh: 0.65
+fuse_score: True
+# min_box_area: 10
+
+# BoT-SORT settings
+gmc_method: sparseOptFlow
+proximity_thresh: 0.5
+appearance_thresh: 0.8
+with_reid: False
+model: auto

@@ -187,6 +187,9 @@ def launch_setup(context, *args, **kwargs):
     use_sensor_data_qos = LaunchConfiguration('use_sensor_data_qos', default=False)
     image_encoding = LaunchConfiguration('image_encoding', default='rgb8')
     stream_package = LaunchConfiguration('stream_package', default='jetson_inference')  # gscam, jetson_inference
+    # 'auto': batch inference when num_cameras>1 (one model in VRAM, ~1.5/fps sync jitter)
+    # 'false': one single_stream_detector per camera (lower latency, N×VRAM)
+    use_multi_stream_detector = LaunchConfiguration('use_multi_stream_detector', default='auto')
 
     # use_composition = LaunchConfiguration('use_composition', default=False)
 
@@ -377,6 +380,17 @@ def launch_setup(context, *args, **kwargs):
         description='Path to the YOLO model file (.engine, .pt, .onnx) used by detection nodes'
     )
 
+    declare_use_multi_stream_detector_cmd = DeclareLaunchArgument(
+        'use_multi_stream_detector',
+        default_value=use_multi_stream_detector,
+        description=(
+            '"auto" (default): use multi_stream_detector when num_cameras>1 — one model in VRAM, '
+            'ApproximateTimeSynchronizer adds ~1.5/fps slop. '
+            '"false": one single_stream_detector per camera — lower per-frame latency, '
+            'but N model copies in VRAM.'
+        )
+    )
+
     # declare_use_composition_cmd = DeclareLaunchArgument(
     #         'use_composition',
     #         default_value=use_composition,
@@ -409,6 +423,7 @@ def launch_setup(context, *args, **kwargs):
         declare_image_encoding_cmd,
         declare_stream_package_cmd,
         declare_model_path_cmd,
+        declare_use_multi_stream_detector_cmd,
         # declare_use_composition_cmd,
     ]
 
@@ -436,6 +451,11 @@ def launch_setup(context, *args, **kwargs):
     use_sensor_data_qos_str = use_sensor_data_qos.perform(context)
     image_encoding_str = image_encoding.perform(context)
     stream_package_str = stream_package.perform(context)
+    use_multi_stream_detector_str = use_multi_stream_detector.perform(context)
+    use_multi_stream_detector_bool = (
+        (use_multi_stream_detector_str.lower() == 'auto' and num_cameras_int > 1)
+        or use_multi_stream_detector_str.lower() == 'true'
+    )
 
     # Ensure lists have the correct length
     assert len(frame_ids_list) == num_cameras_int, "frame_ids list length must match num_cameras"
@@ -762,7 +782,7 @@ def launch_setup(context, *args, **kwargs):
                     'max_det': 100,
                     'augment': False,
                     'queue_size': 1,
-                    'tracker_2d.path': os.path.join(image_detection_config_dir, 'tracker_custom.yaml'),
+                    'tracker_2d.path': os.path.join(image_detection_config_dir, 'tracker_orin_nano.yaml'),
                     'tracker_2d.tracker_type': 'bytetrack',  # bytetrack
                     'tracker_2d.track_high_thresh': 0.45,  # -1.0
                     'tracker_2d.track_low_thresh': -1.0,
@@ -778,7 +798,8 @@ def launch_setup(context, *args, **kwargs):
                 }
             ]
         )
-        nodes_to_launch.append(yolo_node)
+        if not use_multi_stream_detector_bool:
+            nodes_to_launch.append(yolo_node)
 
         multi_stream_remappings.append((f'stream_{i}/image_raw', f"{namespaces_list[i].strip().lstrip('/')}/image_raw"))
         multi_stream_remappings.append((f'stream_{i}/camera_info', f"{namespaces_list[i].strip().lstrip('/')}/camera_info"))
@@ -804,9 +825,13 @@ def launch_setup(context, *args, **kwargs):
         #nodes_to_launch.append(tracking_node)
 
     # multi stream detector
+    # Tradeoff vs per-camera single_stream_detector:
+    #   multi_stream_detector: one model in VRAM (saves memory on Orin Nano), but
+    #     ApproximateTimeSynchronizer adds ~1.5/fps latency per frame.
+    #   single_stream_detector: lower per-frame latency, but N model copies in VRAM.
     multi_yolo_node = Node(
             package='autodriver_image_object_detection',
-            executable='multi_stream_detector',  # yolo_detector
+            executable='multi_stream_detector',
             name='multi_yolo_detection_node',
             namespace=prepend_global_namespace,
             output='screen',
@@ -814,18 +839,20 @@ def launch_setup(context, *args, **kwargs):
                 {
                     'use_sim_time': use_sim_time,
                     'num_cameras': num_cameras,
-                    'synchronization_interval': 0.1,
+                    'fps': int(fps_list[0]) if fps_list else 30,
                     'input_image_topic_is_compressed': [False] * num_cameras_int,
                     'qos': 'SENSOR_DATA' if use_sensor_data_qos_str.lower() == "true" else 'SYSTEM_DEFAULT',
                     'model_path': "yolo11m-seg.engine",  # rtdetr-l.pt, yolo11m-seg.engine
                     'export_model_format': '',
                     'use_gpu': True,
                     'show_image': False,
+                    'tracker_2d.path': os.path.join(image_detection_config_dir, 'tracker_orin_nano.yaml'),
                 }
             ],
             remappings=multi_stream_remappings
     )
-    #nodes_to_launch.append(multi_yolo_node)
+    if use_multi_stream_detector_bool:
+        nodes_to_launch.append(multi_yolo_node)
 
     # RViz node
     rviz_node = Node(

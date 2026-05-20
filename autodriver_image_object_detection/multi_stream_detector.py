@@ -34,8 +34,10 @@ class MultiStreamDetector(BaseDetector):
 
         # Multi-stream-specific params
         self.declare_parameter('num_cameras', 2)
+        self.declare_parameter('fps', 30)
+        _fps = self.get_parameter('fps').get_parameter_value().integer_value
         self.declare_parameter(
-            'synchronization_interval', 0.1,
+            'synchronization_interval', 1.5 / _fps,
             ParameterDescriptor(
                 type=ParameterType.PARAMETER_DOUBLE,
                 description='<0: no sync (per-camera callbacks + timer); '
@@ -50,6 +52,7 @@ class MultiStreamDetector(BaseDetector):
         # Read multi-stream params
         gp = self.get_parameter
         self.num_cameras = gp('num_cameras').get_parameter_value().integer_value
+        self.fps = gp('fps').get_parameter_value().integer_value
         self.synchronization_interval = gp('synchronization_interval').get_parameter_value().double_value
         self.input_image_topic_is_compressed = list(
             gp('input_image_topic_is_compressed').get_parameter_value().bool_array_value)
@@ -71,6 +74,7 @@ class MultiStreamDetector(BaseDetector):
         self.load_model()
 
         qos_profile = self._build_qos_profile()
+        sensor_qos = self._build_sensor_qos_profile()
 
         # Subscribers
         self.subscriptions_ = []
@@ -86,7 +90,7 @@ class MultiStreamDetector(BaseDetector):
             self.image_message_types[camera] = msg_type
 
             if self.synchronization_interval >= 0.0:
-                img_sub = Subscriber(self, msg_type, f'{camera}/image_raw', qos_profile=qos_profile,
+                img_sub = Subscriber(self, msg_type, f'{camera}/image_raw', qos_profile=sensor_qos,
                                      callback_group=self._sub_cb_group)
                 self.subscriptions_.append(img_sub)
                 if self.subscribe_camera_info:
@@ -98,7 +102,7 @@ class MultiStreamDetector(BaseDetector):
                 self.create_subscription(
                     msg_type, f'{camera}/image_raw',
                     lambda msg, idx=i: self.callback_common(msg, idx),
-                    qos_profile=qos_profile,
+                    qos_profile=sensor_qos,
                     callback_group=self._sub_cb_group)
                 self.create_subscription(
                     CameraInfo, f'{camera}/camera_info',
@@ -121,15 +125,15 @@ class MultiStreamDetector(BaseDetector):
         self.debug_pubs = {}
         for camera in self.cameras:
             self.detection_pubs[camera] = self.create_publisher(
-                Detection2DArray, f'{camera}/yolo/detection/results', qos_profile)
+                Detection2DArray, f'{camera}/yolo/detection/results', self.queue_size)
             if self.publish_debug_image:
                 self.debug_pubs[camera] = {
                     'detection': self.create_publisher(
-                        Image, f'{camera}/yolo/detection/debug_image', qos_profile),
+                        Image, f'{camera}/yolo/detection/debug_image', self.queue_size),
                     'segmentation': self.create_publisher(
-                        Image, f'{camera}/yolo/detection/segmentation_image', qos_profile),
+                        Image, f'{camera}/yolo/detection/segmentation_image', self.queue_size),
                     'mask': self.create_publisher(
-                        Image, f'{camera}/yolo/detection/segmentation_mask', qos_profile),
+                        Image, f'{camera}/yolo/detection/segmentation_mask', self.queue_size),
                 }
 
         self.get_logger().info(
