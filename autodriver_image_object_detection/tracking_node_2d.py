@@ -83,7 +83,13 @@ class TrackingNode(BaseDetector):
         # parse detections
         detection_list = []
         for detection in detections_msg.detections:
-            # convert YOLO class ID from string to int
+            # 6th column is the class index for the tracker. detection.id is a
+            # ROS2 string field that is "" for untracked input, so int("") would
+            # raise; parse defensively and fall back to class 0.
+            try:
+                cls_idx = int(detection.id) if detection.id else 0
+            except (ValueError, TypeError):
+                cls_idx = 0
 
             detection_list.append(
                     [
@@ -92,7 +98,7 @@ class TrackingNode(BaseDetector):
                         detection.bbox.center.position.x + detection.bbox.size_x / 2,
                         detection.bbox.center.position.y + detection.bbox.size_y / 2,
                         detection.results[0].hypothesis.score,
-                        int(detection.id),  # detection.results[0].hypothesis.class_id,
+                        cls_idx,
                     ]
             )
 
@@ -111,7 +117,7 @@ class TrackingNode(BaseDetector):
                     # IoU match: find the input detection whose box best overlaps this tracked box.
                     # t[-1] is tracker-internal class index, NOT a detection list index.
                     tracked_xyxy = tracked_box.xyxy[0].tolist()
-                    best_iou, best_idx = 0.0, 0
+                    best_iou, best_idx = 0.0, -1
                     for j, det_msg in enumerate(detections_msg.detections):
                         cx, cy = det_msg.bbox.center.position.x, det_msg.bbox.center.position.y
                         hw, hh = det_msg.bbox.size_x / 2, det_msg.bbox.size_y / 2
@@ -127,6 +133,10 @@ class TrackingNode(BaseDetector):
                         iou = inter / union if union > 0 else 0.0
                         if iou > best_iou:
                             best_iou, best_idx = iou, j
+                    # No overlapping detection: skip rather than corrupting the
+                    # first detection in the list with this track's box.
+                    if best_idx < 0:
+                        continue
                     tracked_detection = detections_msg.detections[best_idx]
 
                     # get boxes values

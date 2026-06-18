@@ -217,11 +217,23 @@ class BaseDetector(Node):
             self.get_logger().info(f'Export complete: {self.model_path}')
 
         if model_path.suffix in ('.engine', '.onnx'):
-            try:
-                model_class(str(model_path))  # probe only — raises if missing
-            except FileNotFoundError:
+            needs_export = False
+            if not model_path.exists():
+                needs_export = True
+            else:
+                try:
+                    probe_model = model_class(str(model_path))
+                    # Trigger the actual deserialisation/load by accessing names
+                    names = probe_model.names
+                    if names is None or isinstance(probe_model.model, str):
+                        needs_export = True
+                except Exception as e:
+                    self.get_logger().warn(f'Failed to probe {model_path}: {e}. Will attempt to re-export.')
+                    needs_export = True
+
+            if needs_export:
                 fmt = model_path.suffix.lstrip('.')
-                self.get_logger().info(f'{model_path} not found. Exporting from .pt...')
+                self.get_logger().info(f'{model_path} failed to load or does not exist. Exporting from .pt...')
                 model_class(str(model_path.with_suffix('.pt'))).export(
                     format=fmt,
                     half=self.half_precision,
@@ -378,7 +390,13 @@ class BaseDetector(Node):
         detections_msg.header.stamp = header.stamp
         detections_msg.header.frame_id = header.frame_id
 
-        detection_image = result.plot(conf=True, labels=True, boxes=True, masks=True, probs=True)
+        # result.plot() rasterises boxes/masks/labels onto a fresh image and is
+        # expensive (notably on Jetson). Only render when a consumer exists.
+        render = self.show_image or self.publish_debug_image
+        detection_image = (
+            result.plot(conf=True, labels=True, boxes=True, masks=True, probs=True)
+            if render else None
+        )
         if self.show_image:
             cv2.imshow('detection', detection_image)
             cv2.waitKey(1)
@@ -389,7 +407,7 @@ class BaseDetector(Node):
         if boxes.shape[0] < 1:
             return detections_msg, detection_image, mask_img
 
-        if result.masks is not None:
+        if result.masks is not None and render:
             mask_img = (torch.sum(result.masks.data, dim=0).cpu().numpy() * 255).astype(np.uint8)
             if self.show_image:
                 cv2.imshow('mask', mask_img)
@@ -407,7 +425,8 @@ class BaseDetector(Node):
             x, y, w, h = bbox
             track_id = track_ids[i] if track_ids is not None else -1
 
-            if self.track_2d and self.plot_tracks and hasattr(self, 'track_history'):
+            if (self.track_2d and self.plot_tracks and detection_image is not None
+                    and hasattr(self, 'track_history')):
                 track = self.track_history[track_id]
                 track.append((float(x), float(y)))
                 if len(track) > 30:
