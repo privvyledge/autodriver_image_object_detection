@@ -19,6 +19,7 @@ import rclpy
 import rclpy.duration
 import rclpy.time
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 from cv_bridge import CvBridge
 from message_filters import Subscriber, TimeSynchronizer, ApproximateTimeSynchronizer
@@ -30,10 +31,15 @@ from image_geometry import PinholeCameraModel
 import tf2_ros
 from tf2_ros import TransformListener, Buffer
 
+from rclpy.parameter import Parameter
+from rcl_interfaces.msg import SetParametersResult
+
 from autodriver_image_object_detection.base_detector import BaseDetector
+from autodriver_image_object_detection.utils.common import make_deleteall_marker_array
 from autodriver_image_object_detection.utils.pointcloud_utils import (
     unpack_pointcloud_message, create_marker, project_depth_to_3d,
 )
+from autodriver_image_object_detection.utils.profiling import setup_profiler, apply_profiler_param
 
 
 def _quaternion_to_matrix(q):
@@ -95,6 +101,15 @@ class DepthFusionNode(BaseDetector):
         self.declare_parameter('cluster_min_height', 0.1)
         self.declare_parameter('cluster_max_height', 2.0)
         self.declare_parameter('bounding_box_type', 'AABB')
+        self.declare_parameter(
+            'publish_empty_detections', True,
+            ParameterDescriptor(
+                type=ParameterType.PARAMETER_BOOL,
+                description='On a zero-detection frame, skip projection but still publish an '
+                            'empty Detection3DArray + DELETEALL MarkerArray (heartbeat for '
+                            'downstream costmap/obstacle clearing). False restores the original '
+                            'behaviour of publishing nothing on empty frames.',
+            ))
 
         gp = self.get_parameter
         self.detections_2d_topic = gp('detections_2d_topic').value
@@ -121,6 +136,7 @@ class DepthFusionNode(BaseDetector):
         self.cluster_min_height = gp('cluster_min_height').value
         self.cluster_max_height = gp('cluster_max_height').value
         self.bounding_box_type = gp('bounding_box_type').value
+        self.publish_empty_detections = gp('publish_empty_detections').value
 
         # ---------------------------------------------------------------- device
         self._setup_device()
@@ -159,40 +175,55 @@ class DepthFusionNode(BaseDetector):
                 self.o3d_pointcloud = o3d.t.geometry.PointCloud(self.o3d_device)
 
         qos_profile = self._build_qos_profile()
-        sensor_qos = self._build_sensor_qos_profile()
+        # BEST_EFFORT with queue_size depth so the synchronizer has enough history to match.
+        # _build_sensor_qos_profile() uses depth=1 which is too aggressive for synced topics.
+        sensor_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=self.queue_size,
+        )
 
         # ---------------------------------------------------------------- synchronized subscriptions
-        self._subs = []
-        self._depth_idx = None
-        self._pc_idx = None
-
-        self._det_sub = Subscriber(
-            self, Detection2DArray, self.detections_2d_topic, qos_profile=qos_profile,
-            callback_group=self._sub_cb_group)
-        self._subs.append(self._det_sub)
+        # Two independent 2-way synchronizers so the depth path and pointcloud path fire
+        # independently. A single 3-way synchronizer would require all three topics to match
+        # simultaneously — if pointcloud timestamps drift, depth output silently stops too.
+        _has_output = False
 
         if self.use_depth:
+            self._det_depth_sub = Subscriber(
+                self, Detection2DArray, self.detections_2d_topic, qos_profile=qos_profile,
+                callback_group=self._sub_cb_group)
             self._depth_sub = Subscriber(
                 self, Image, self.depth_image_topic, qos_profile=sensor_qos,
                 callback_group=self._sub_cb_group)
-            self._depth_idx = len(self._subs)
-            self._subs.append(self._depth_sub)
+            if self.synchronization_interval > 0.0:
+                self._depth_ts = ApproximateTimeSynchronizer(
+                    [self._det_depth_sub, self._depth_sub],
+                    self.queue_size, slop=self.synchronization_interval)
+            else:
+                self._depth_ts = TimeSynchronizer(
+                    [self._det_depth_sub, self._depth_sub], self.queue_size)
+            self._depth_ts.registerCallback(self._depth_fusion_callback)
+            _has_output = True
 
         if self.use_pointcloud:
+            self._det_pc_sub = Subscriber(
+                self, Detection2DArray, self.detections_2d_topic, qos_profile=qos_profile,
+                callback_group=self._sub_cb_group)
             self._pc_sub = Subscriber(
                 self, PointCloud2, self.pointcloud_topic, qos_profile=sensor_qos,
                 callback_group=self._sub_cb_group)
-            self._pc_idx = len(self._subs)
-            self._subs.append(self._pc_sub)
-
-        if len(self._subs) > 1:
             if self.synchronization_interval > 0.0:
-                self._ts = ApproximateTimeSynchronizer(
-                    self._subs, self.queue_size, slop=self.synchronization_interval)
+                self._pc_ts = ApproximateTimeSynchronizer(
+                    [self._det_pc_sub, self._pc_sub],
+                    self.queue_size, slop=self.synchronization_interval)
             else:
-                self._ts = TimeSynchronizer(self._subs, self.queue_size)
-            self._ts.registerCallback(self.fusion_callback)
-        else:
+                self._pc_ts = TimeSynchronizer(
+                    [self._det_pc_sub, self._pc_sub], self.queue_size)
+            self._pc_ts.registerCallback(self._pc_fusion_callback)
+            _has_output = True
+
+        if not _has_output:
             self.get_logger().warn(
                 'depth_fusion_node: use_depth and use_pointcloud are both False — no 3D output.')
 
@@ -217,6 +248,9 @@ class DepthFusionNode(BaseDetector):
             self.marker_pc_pub = self.create_publisher(
                 MarkerArray, 'depth_fusion/markers_pointcloud', self.queue_size)
 
+        self.profiler = setup_profiler(self)
+        self.add_on_set_parameters_callback(self.parameter_change_callback)
+
         self.get_logger().info(
             f'depth_fusion_node started. '
             f'depth={self.use_depth}, pointcloud={self.use_pointcloud}, '
@@ -237,31 +271,52 @@ class DepthFusionNode(BaseDetector):
             self.depth_camera_model.fromCameraInfo(msg)
             self.depth_frame_id = msg.header.frame_id
 
-    # ------------------------------------------------------------ main callback
+    # ------------------------------------------------------------ main callbacks
 
-    def fusion_callback(self, *msgs):
+    def _depth_fusion_callback(self, detections_msg, depth_msg):
         if self.rgb_camera_info is None:
             self.get_logger().warn('Waiting for RGB CameraInfo...', once=True)
             return
-
-        detections_msg = msgs[0]
         if not detections_msg.detections:
+            # Zero detections: skip the expensive projection but emit a heartbeat so
+            # downstream costmaps can clear and stale RViz markers are removed.
+            self._publish_empty_3d(self.detection3d_depth_pub, self.marker_depth_pub,
+                                    detections_msg.header)
             return
-
-        depth_msg = msgs[self._depth_idx] if self._depth_idx is not None else None
-        pc_msg = msgs[self._pc_idx] if self._pc_idx is not None else None
-
-        if depth_msg is not None and self.depth_camera_info is not None:
-            try:
+        if self.depth_camera_info is None:
+            self.get_logger().warn('Waiting for depth CameraInfo...', once=True)
+            return
+        try:
+            with self.profiler.measure("depth_projection"):
                 self._process_depth(detections_msg, depth_msg)
-            except Exception as e:
-                self.get_logger().error(f'Depth fusion error: {e}')
+        except Exception as e:
+            self.get_logger().error(f'Depth fusion error: {e}')
+        self.profiler.flush(self)
 
-        if pc_msg is not None:
-            try:
+    def _pc_fusion_callback(self, detections_msg, pc_msg):
+        if self.rgb_camera_info is None:
+            self.get_logger().warn('Waiting for RGB CameraInfo...', once=True)
+            return
+        if not detections_msg.detections:
+            self._publish_empty_3d(self.detection3d_pc_pub, self.marker_pc_pub,
+                                    detections_msg.header)
+            return
+        try:
+            with self.profiler.measure("pointcloud_projection"):
                 self._process_pointcloud(detections_msg, pc_msg)
-            except Exception as e:
-                self.get_logger().error(f'Pointcloud fusion error: {e}')
+        except Exception as e:
+            self.get_logger().error(f'Pointcloud fusion error: {e}')
+        self.profiler.flush(self)
+
+    def _publish_empty_3d(self, det_pub, marker_pub, header):
+        """Publish an empty Detection3DArray + DELETEALL markers (heartbeat)."""
+        if not self.publish_empty_detections:
+            return
+        det3d_arr = Detection3DArray()
+        det3d_arr.header.frame_id = self.output_frame or header.frame_id or ''
+        det3d_arr.header.stamp = header.stamp
+        det_pub.publish(det3d_arr)
+        marker_pub.publish(make_deleteall_marker_array())
 
     # ------------------------------------------------------------ depth path
 
@@ -313,7 +368,7 @@ class DepthFusionNode(BaseDetector):
             sy = z3 * int(bbox[3]) / rfy
 
             det3d_arr.detections.append(
-                self._make_detection3d(x3, y3, z3, sx, sy, 0.0, conf, cls_name, frame_id))
+                self._make_detection3d(x3, y3, z3, sx, sy, 0.0, conf, cls_name, frame_id=frame_id))
             marker_arr.markers.append(
                 create_marker(i, x3, y3, z3, sx, sy, 0.0, frame_id,
                               timestamp=timestamp, rgba=[1.0, 0.0, 0.0, 0.5]))
@@ -325,6 +380,11 @@ class DepthFusionNode(BaseDetector):
         if self._depth_to_rgb_tf is not None and self.static_camera_to_robot_tf:
             return
         if not (self.depth_frame_id and self.rgb_frame_id):
+            return
+        if self.depth_frame_id == self.rgb_frame_id:
+            self._depth_to_rgb_tf = np.eye(4, dtype=np.float64)
+            self._depth_to_rgb_tf_torch = torch.eye(
+                4, dtype=torch.float32, device=self.torch_device)
             return
         transform = self.lookup_transform(self.depth_frame_id, self.rgb_frame_id,
                                            rclpy.time.Time())
@@ -401,7 +461,8 @@ class DepthFusionNode(BaseDetector):
         det3d_arr.header.stamp = timestamp
         marker_arr = MarkerArray()
 
-        if self._pc_to_rgb_tf_o3d is not None:
+        if (self._pc_to_rgb_tf_o3d is not None
+                and not np.allclose(self._pc_to_rgb_tf, np.eye(4))):
             pts_rgb = self.o3d_pointcloud.clone().transform(self._pc_to_rgb_tf_o3d).point.positions
         else:
             pts_rgb = self.o3d_pointcloud.point.positions
@@ -451,6 +512,12 @@ class DepthFusionNode(BaseDetector):
                if (self.output_frame and self.camera_to_robot_tf is not None)
                else self.pc_frame_id)
         if not src:
+            return
+        if src == self.rgb_frame_id:
+            self._pc_to_rgb_tf = np.eye(4, dtype=np.float64)
+            if OPEN3D_AVAILABLE:
+                self._pc_to_rgb_tf_o3d = o3c.Tensor(
+                    self._pc_to_rgb_tf, dtype=o3c.float32, device=self.o3d_device)
             return
         t = self.lookup_transform(src, self.rgb_frame_id, rclpy.time.Time())
         if t is not None:
@@ -614,6 +681,18 @@ class DepthFusionNode(BaseDetector):
         mat = quaternion_matrix(q) if _TF_TRANSFORMS else _quaternion_to_matrix(q)
         mat[:3, 3] = [t.x, t.y, t.z]
         return mat
+
+    # ------------------------------------------------------------ parameter callback
+
+    def parameter_change_callback(self, params):
+        """Handle runtime updates for profiling and the empty-3D heartbeat."""
+        result = SetParametersResult(successful=True)
+        for param in params:
+            if apply_profiler_param(self.profiler, param.name, param.value):
+                pass
+            elif param.name == 'publish_empty_detections' and param.type_ == Parameter.Type.BOOL:
+                self.publish_empty_detections = param.value
+        return result
 
     # ------------------------------------------------------------ cleanup
 

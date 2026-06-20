@@ -191,6 +191,13 @@ def launch_setup(context, *args, **kwargs):
     # 'false': one single_stream_detector per camera (lower latency, N×VRAM)
     use_multi_stream_detector = LaunchConfiguration('use_multi_stream_detector', default='auto')
 
+    # Per-stage execution-time profiling (off by default)
+    profile = LaunchConfiguration('profile', default='False')
+    profile_log = LaunchConfiguration('profile_log', default='True')
+    profile_publish = LaunchConfiguration('profile_publish', default='False')
+    profile_log_interval = LaunchConfiguration('profile_log_interval', default='5.0')
+    profile_window = LaunchConfiguration('profile_window', default='200')
+
     # use_composition = LaunchConfiguration('use_composition', default=False)
 
     # Declare launch arguments
@@ -391,6 +398,22 @@ def launch_setup(context, *args, **kwargs):
         )
     )
 
+    declare_profile_cmd = DeclareLaunchArgument(
+        'profile', default_value=profile,
+        description='Enable per-stage execution-time profiling on detector nodes')
+    declare_profile_log_cmd = DeclareLaunchArgument(
+        'profile_log', default_value=profile_log,
+        description='Profiling: emit throttled mean/min/max/count log lines')
+    declare_profile_publish_cmd = DeclareLaunchArgument(
+        'profile_publish', default_value=profile_publish,
+        description='Profiling: publish per-frame Float32MultiArray on <node>/profile')
+    declare_profile_log_interval_cmd = DeclareLaunchArgument(
+        'profile_log_interval', default_value=profile_log_interval,
+        description='Profiling: seconds between aggregate log lines')
+    declare_profile_window_cmd = DeclareLaunchArgument(
+        'profile_window', default_value=profile_window,
+        description='Profiling: rolling-window sample count for aggregate stats')
+
     # declare_use_composition_cmd = DeclareLaunchArgument(
     #         'use_composition',
     #         default_value=use_composition,
@@ -424,6 +447,11 @@ def launch_setup(context, *args, **kwargs):
         declare_stream_package_cmd,
         declare_model_path_cmd,
         declare_use_multi_stream_detector_cmd,
+        declare_profile_cmd,
+        declare_profile_log_cmd,
+        declare_profile_publish_cmd,
+        declare_profile_log_interval_cmd,
+        declare_profile_window_cmd,
         # declare_use_composition_cmd,
     ]
 
@@ -456,6 +484,16 @@ def launch_setup(context, *args, **kwargs):
         (use_multi_stream_detector_str.lower() == 'auto' and num_cameras_int > 1)
         or use_multi_stream_detector_str.lower() == 'true'
     )
+
+    # Per-stage profiling params (shared by all detector nodes). Resolved to typed
+    # values so they don't clash with the nodes' bool/float/int param declarations.
+    profile_params = {
+        'profile': profile.perform(context).lower() in ('true', '1'),
+        'profile_log': profile_log.perform(context).lower() in ('true', '1'),
+        'profile_publish': profile_publish.perform(context).lower() in ('true', '1'),
+        'profile_log_interval': float(profile_log_interval.perform(context)),
+        'profile_window': int(profile_window.perform(context)),
+    }
 
     # Ensure lists have the correct length
     assert len(frame_ids_list) == num_cameras_int, "frame_ids list length must match num_cameras"
@@ -795,6 +833,7 @@ def launch_setup(context, *args, **kwargs):
                     'tracker_2d.appearance_thresh': -1.0,
                     'tracker_2d.with_reid': False,  # False
                     'tracker_2d.model': 'auto',
+                    **profile_params,
                 }
             ]
         )
@@ -847,6 +886,7 @@ def launch_setup(context, *args, **kwargs):
                     'use_gpu': True,
                     'show_image': False,
                     'tracker_2d.path': os.path.join(image_detection_config_dir, 'tracker_orin_nano.yaml'),
+                    **profile_params,
                 }
             ],
             remappings=multi_stream_remappings

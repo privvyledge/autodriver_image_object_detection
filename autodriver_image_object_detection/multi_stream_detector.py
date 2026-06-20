@@ -9,6 +9,7 @@ from vision_msgs.msg import Detection2DArray
 
 from autodriver_image_object_detection.base_detector import BaseDetector
 from autodriver_image_object_detection.utils.imaging_utils import parse_image_message
+from autodriver_image_object_detection.utils.profiling import setup_profiler, apply_profiler_param
 
 
 class MultiStreamDetector(BaseDetector):
@@ -136,6 +137,8 @@ class MultiStreamDetector(BaseDetector):
                         Image, f'{camera}/yolo/detection/segmentation_mask', self.queue_size),
                 }
 
+        self.profiler = setup_profiler(self)
+
         self.get_logger().info(
             f'multi_stream_detector started on {self.device} with {self.num_cameras} camera(s).')
 
@@ -236,20 +239,25 @@ class MultiStreamDetector(BaseDetector):
 
     def _run_batch_inference(self):
         images = list(self.images.values())
-        self.detect_objects(images)
+        with self.profiler.measure("detection"):
+            self.detect_objects(images)
+        self.profiler.record_speed(self.results)
         if self.results is None:
+            self.profiler.flush(self)
             return
         for i, (result, camera) in enumerate(zip(self.results, self.cameras)):
             detections_msg, detection_image, mask_img = super().create_detections_array(
                 result, self.headers[camera])
             self.detection_pubs[camera].publish(detections_msg)
             self._publish_debug_images(camera, detection_image, mask_img)
+        self.profiler.flush(self)
 
     # ------------------------------------------------------- parameter callback
 
     def parameter_change_callback(self, params):
         result = super().parameter_change_callback(params)
         for param in params:
+            apply_profiler_param(self.profiler, param.name, param.value)
             self.get_logger().info(
                 f'Param {param.name} → {param.value}: success={result.successful}')
         return result

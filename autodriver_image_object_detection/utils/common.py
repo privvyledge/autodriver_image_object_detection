@@ -100,6 +100,21 @@ def pack_derived_object_msg(x, y, size_x, size_y, class_id, conf, id=None, z_siz
 
     return obj
 
+
+def make_deleteall_marker_array():
+    """Return a MarkerArray containing a single DELETEALL marker.
+
+    Publishing this clears all previously published markers in RViz — used on
+    zero-detection frames so stale boxes don't linger when objects leave view.
+    """
+    from visualization_msgs.msg import Marker, MarkerArray
+    marker_arr = MarkerArray()
+    marker = Marker()
+    marker.action = Marker.DELETEALL
+    marker_arr.markers.append(marker)
+    return marker_arr
+
+
 def update_tracker_param(param_name, new_value, old_value):
     # assert that both types match
     if type(new_value) != type(old_value):

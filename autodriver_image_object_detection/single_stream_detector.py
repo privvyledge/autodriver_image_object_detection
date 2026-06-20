@@ -20,6 +20,7 @@ except ImportError:
 from autodriver_image_object_detection.base_detector import BaseDetector
 from autodriver_image_object_detection.utils.common import pack_derived_object_msg, pack_nav2_obstacle_msg
 from autodriver_image_object_detection.utils.imaging_utils import parse_image_message
+from autodriver_image_object_detection.utils.profiling import setup_profiler, apply_profiler_param
 
 
 class SingleStreamDetector(BaseDetector):
@@ -107,6 +108,8 @@ class SingleStreamDetector(BaseDetector):
             self.segmentation_mask_image_pub = self.create_publisher(
                 self.image_message_type, self.segmentation_mask_image_topic, self.queue_size)
 
+        self.profiler = setup_profiler(self)
+
         self.add_on_set_parameters_callback(self.parameter_change_callback)
 
         self._image_queue = queue.Queue(maxsize=2)
@@ -164,10 +167,13 @@ class SingleStreamDetector(BaseDetector):
                         and (self.image_height, self.image_width) != (self.imgsz[0], self.imgsz[1])):
                     cv_image = cv2.resize(cv_image, (self.imgsz[1], self.imgsz[0]))
 
-                self.detect_objects(cv_image)
+                with self.profiler.measure("detection"):
+                    self.detect_objects(cv_image)
+                self.profiler.record_speed(self.results)
                 detection_msg, detection_image, mask_img = self.parse_results(self.results, msg.header)
 
                 if detection_msg is None:
+                    self.profiler.flush(self)
                     continue
                 self.detection_results_pub.publish(detection_msg)
 
@@ -213,6 +219,8 @@ class SingleStreamDetector(BaseDetector):
                         cmask_msg.header.frame_id = image_frame_id
                         cmask_msg.header.stamp = msg_timestamp
                         self.segmentation_image_pub.publish(cmask_msg)
+
+                self.profiler.flush(self)
 
             except Exception as e:
                 self.get_logger().error(f'Error processing image: {e}')
@@ -272,7 +280,9 @@ class SingleStreamDetector(BaseDetector):
         result = super().parameter_change_callback(params)
         for param in params:
             name, val, ptype = param.name, param.value, param.type_
-            if name == 'model_path' and ptype == Parameter.Type.STRING:
+            if apply_profiler_param(self.profiler, name, val):
+                pass
+            elif name == 'model_path' and ptype == Parameter.Type.STRING:
                 self.model_path = val
                 # todo: reload model
             elif name == 'update_class' and ptype == Parameter.Type.STRING:

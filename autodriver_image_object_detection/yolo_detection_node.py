@@ -123,8 +123,9 @@ import tf2_ros
 from tf2_ros import TransformBroadcaster, TransformListener, Buffer, LookupException, ConnectivityException, \
     ExtrapolationException
 
-from autodriver_image_object_detection.utils.common import pack_2d_detection, pack_nav2_obstacle_msg, pack_derived_object_msg, update_tracker_param
+from autodriver_image_object_detection.utils.common import pack_2d_detection, pack_nav2_obstacle_msg, pack_derived_object_msg, update_tracker_param, make_deleteall_marker_array
 from autodriver_image_object_detection.utils.imaging_utils import parse_image_message as _parse_image_message
+from autodriver_image_object_detection.utils.profiling import setup_profiler, apply_profiler_param
 
 if OPEN3D_AVAILABLE:
     from autodriver_pointcloud_preprocessor.pointcloud_preprocessor import PointcloudPreprocessorNode
@@ -253,6 +254,7 @@ class ImageObstacleDetectionNode(Node):
         self.declare_parameter('static_camera_info', True)
         self.declare_parameter("transform_timeout", 2.0)  # 0.1
         self.declare_parameter("project_to_3d", True)  # todo: remove this flag and just use depth or pointcloud
+        self.declare_parameter("publish_empty_detections", True)  # heartbeat: publish empty 3D + DELETEALL markers on zero-detection frames
         self.declare_parameter("use_depth",
                                True)  # can run both at the same time at the cost of speed. Depth is significantly faster for now (about 2.5 times)
         self.declare_parameter("use_pointcloud",
@@ -322,6 +324,7 @@ class ImageObstacleDetectionNode(Node):
         self.augment = self.get_parameter("augment").get_parameter_value().bool_value
         self.verbose = self.get_parameter("verbose").get_parameter_value().bool_value
         self.project_to_3d = self.get_parameter("project_to_3d").get_parameter_value().bool_value
+        self.publish_empty_detections = self.get_parameter("publish_empty_detections").get_parameter_value().bool_value
         self.use_depth = self.get_parameter("use_depth").get_parameter_value().bool_value
         self.use_pointcloud = self.get_parameter("use_pointcloud").get_parameter_value().bool_value
         self.output_frame = self.get_parameter("output_frame").value
@@ -652,6 +655,9 @@ class ImageObstacleDetectionNode(Node):
 
             self.tracker_2d_cfg['path'] = self.temp_file.name
 
+        # Optional per-stage execution-time profiling (off by default).
+        self.profiler = setup_profiler(self)
+
         # Setup dynamic parameter reconfiguring.
         # Register a callback function that will be called whenever there is an attempt to
         # change one or more parameters of the node.
@@ -782,7 +788,9 @@ class ImageObstacleDetectionNode(Node):
 
             self.inference_dict['imgsz'] = self.imgsz
             # detect/track objects in the visual image
-            self.detect_objects(self.images['rgb'])
+            with self.profiler.measure("detection"):
+                self.detect_objects(self.images['rgb'])
+            self.profiler.record_speed(self.results)
 
             if self.project_to_3d and self.use_pointcloud:
                 # unpack pointcloud message
@@ -889,6 +897,8 @@ class ImageObstacleDetectionNode(Node):
                         color_mask_image_msg.header.frame_id = self.frame_ids['rgb']
                         color_mask_image_msg.header.stamp = self.headers['rgb'].stamp
                         self.segmentation_image_pub.publish(color_mask_image_msg)
+
+            self.profiler.flush(self)
 
         except Exception as e:
             self.get_logger().error(f'Error processing image: {e}')
@@ -1091,6 +1101,16 @@ class ImageObstacleDetectionNode(Node):
             probs = result.probs
 
             if bounding_box.shape[0] < 1:
+                # Zero detections: skip projection but emit a heartbeat (empty 3D +
+                # DELETEALL markers) so downstream costmaps clear and stale RViz
+                # markers are removed when objects leave the frame.
+                if self.project_to_3d and self.publish_empty_detections:
+                    if self.use_depth:
+                        self.detection3d_depth_results_pub.publish(detection3d_depth_array)
+                        self.marker_depth_pub.publish(make_deleteall_marker_array())
+                    if self.use_pointcloud:
+                        self.detection3d_pointcloud_results_pub.publish(detection3d_pointcloud_array)
+                        self.marker_pointcloud_pub.publish(make_deleteall_marker_array())
                 return detections_msg, mask_img
 
             track_ids = None
@@ -1164,8 +1184,9 @@ class ImageObstacleDetectionNode(Node):
                 if self.project_to_3d:
                     # could run depth and pointcloud processing in different threads
                     if self.use_depth and (self.images['depth'] is not None):
-                        x, y, z, size_x, size_y, size_z, quat, points_3d = self.project_to_3d_with_depth(
-                            mask, bbox, self.images['depth'])
+                        with self.profiler.measure("depth_projection"):
+                            x, y, z, size_x, size_y, size_z, quat, points_3d = self.project_to_3d_with_depth(
+                                mask, bbox, self.images['depth'])
 
                         if x is not None:
                             # transform the boxes to the robot frame
@@ -1188,8 +1209,9 @@ class ImageObstacleDetectionNode(Node):
                                     rgba=[1.0, 0.0, 0.0, 0.5]))
 
                     if self.use_pointcloud and (self.images['pointcloud'] is not None):
-                        x, y, z, size_x, size_y, size_z, quat, points_3d = self.project_to_3d_with_pointcloud(
-                            mask, bbox, self.images['pointcloud'])
+                        with self.profiler.measure("pointcloud_projection"):
+                            x, y, z, size_x, size_y, size_z, quat, points_3d = self.project_to_3d_with_pointcloud(
+                                mask, bbox, self.images['pointcloud'])
 
                         if x is not None:
                             # no need to transform the boxes to the robot frame since the pointcloud is transformed
@@ -1216,11 +1238,19 @@ class ImageObstacleDetectionNode(Node):
             if self.project_to_3d:
                 if self.use_depth:
                     self.detection3d_depth_results_pub.publish(detection3d_depth_array)
-                    self.marker_depth_pub.publish(marker_depth_array)
+                    # No valid projection this frame: DELETEALL clears stale markers
+                    # (an empty MarkerArray would leave old boxes on screen).
+                    if not marker_depth_array.markers and self.publish_empty_detections:
+                        self.marker_depth_pub.publish(make_deleteall_marker_array())
+                    else:
+                        self.marker_depth_pub.publish(marker_depth_array)
 
                 if self.use_pointcloud:
                     self.detection3d_pointcloud_results_pub.publish(detection3d_pointcloud_array)
-                    self.marker_pointcloud_pub.publish(marker_pointcloud_array)
+                    if not marker_pointcloud_array.markers and self.publish_empty_detections:
+                        self.marker_pointcloud_pub.publish(make_deleteall_marker_array())
+                    else:
+                        self.marker_pointcloud_pub.publish(marker_pointcloud_array)
         return detections_msg, mask_img
 
     @staticmethod
@@ -1975,6 +2005,10 @@ class ImageObstacleDetectionNode(Node):
                 self.inference_dict['verbose'] = self.verbose
             elif param.name == 'static_camera_info' and param.type_ == Parameter.Type.BOOL:
                 self.static_camera_info = param.value
+            elif param.name == 'publish_empty_detections' and param.type_ == Parameter.Type.BOOL:
+                self.publish_empty_detections = param.value
+            elif apply_profiler_param(self.profiler, param.name, param.value):
+                pass
             else:
                 result.successful = False
             self.get_logger().info(f"Success = {result.successful} for param {param.name} to value {param.value}")
