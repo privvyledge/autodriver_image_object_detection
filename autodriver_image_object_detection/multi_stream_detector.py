@@ -200,7 +200,10 @@ class MultiStreamDetector(BaseDetector):
                     new_w = w if w % 32 == 0 else ((w // 32) + 1) * 32
                     self.imgszs[camera] = (new_h, new_w)
                 else:
-                    self.imgszs[camera] = (640, 640)
+                    # Honour the shared param contract: fixed inference size comes from
+                    # image_dimensions ([H, W]), matching single_stream_detector. A
+                    # hardcoded 640 silently mismatches engines exported for other shapes.
+                    self.imgszs[camera] = tuple(self.image_dimensions)
 
             if (self.resize_image and self.use_image_dimensions
                     and (self.image_heights[camera], self.image_widths[camera])

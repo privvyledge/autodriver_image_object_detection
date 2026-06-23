@@ -231,23 +231,23 @@ class BaseDetector(Node):
 
         if model_path.suffix in ('.engine', '.onnx'):
             needs_export = False
-            if not model_path.exists():
-                needs_export = True
-            else:
-                try:
-                    probe_model = model_class(str(model_path))
-                    # Trigger the actual deserialisation/load by accessing names.
-                    # NOTE: do NOT treat `probe_model.model` being a str path as a failure.
-                    # Ultralytics keeps the weights path as a string for exported formats
-                    # (.engine/.onnx) until the inference backend is lazily initialised, so
-                    # that check fired on EVERY valid engine and forced a needless ~5-min
-                    # re-export on every startup.
-                    names = probe_model.names
-                    if not names:
-                        needs_export = True
-                except Exception as e:
-                    self.get_logger().warn(f'Failed to probe {model_path}: {e}. Will attempt to re-export.')
+            # Do NOT pre-check model_path.exists(): a relative model_path resolves against
+            # the launch cwd, so .exists() returns False for an engine Ultralytics could
+            # still find via its own asset/search dirs — forcing a needless ~5-min
+            # re-export on every startup. Let the probe decide instead.
+            try:
+                probe_model = model_class(str(model_path))
+                # Trigger the actual deserialisation/load by accessing names.
+                # NOTE: do NOT treat `probe_model.model` being a str path as a failure.
+                # Ultralytics keeps the weights path as a string for exported formats
+                # (.engine/.onnx) until the inference backend is lazily initialised, so
+                # that check fired on EVERY valid engine and forced a needless re-export.
+                names = probe_model.names
+                if not names:
                     needs_export = True
+            except Exception as e:
+                self.get_logger().warn(f'Failed to load {model_path}: {e}. Will attempt to re-export.')
+                needs_export = True
 
             if needs_export:
                 fmt = model_path.suffix.lstrip('.')
@@ -361,6 +361,8 @@ class BaseDetector(Node):
             f"Unsupported tracker type: {tracker_cfg['tracker_type']}"
         self._tracker_temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.yaml')
         yaml.safe_dump(tracker_cfg, self._tracker_temp_file, default_flow_style=False, sort_keys=False)
+        # Flush before Ultralytics reads the path, or it may see stale/empty content.
+        self._tracker_temp_file.flush()
         self.tracker_2d_cfg['path'] = self._tracker_temp_file.name
 
     # -------------------------------------------------------------- QoS

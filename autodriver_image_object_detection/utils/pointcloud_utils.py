@@ -122,10 +122,14 @@ def project_depth_to_3d(bbox_xywh, depth_image: np.ndarray, camera_model, depth_
         mask_data = mask.data.cpu().numpy().astype(np.uint8)[0] * 255
         roi = cv2_bitwise_and_depth(depth_image, mask_data)
     else:
+        # Slice upper bound is exclusive, so clamp to shape (not shape-1) to keep the
+        # edge column/row, and guarantee a >=1px ROI so tiny/edge bboxes aren't empty.
         u0 = max(cx - w // 2, 0)
-        u1 = min(cx + w // 2, depth_image.shape[1] - 1)
+        u1 = min(cx + w // 2, depth_image.shape[1])
         v0 = max(cy - h // 2, 0)
-        v1 = min(cy + h // 2, depth_image.shape[0] - 1)
+        v1 = min(cy + h // 2, depth_image.shape[0])
+        u1 = max(u1, u0 + 1)
+        v1 = max(v1, v0 + 1)
         roi = depth_image[v0:v1, u0:u1]
 
     roi_m = roi.astype(np.float32) / depth_scale

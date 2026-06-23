@@ -102,14 +102,20 @@ class DepthFusionNode(BaseDetector):
         self.declare_parameter('cluster_max_height', 2.0)
         self.declare_parameter('bounding_box_type', 'AABB')
         self.declare_parameter(
-            'apply_optical_to_body', True,
+            'optical_frame_id', '',
             ParameterDescriptor(
-                type=ParameterType.PARAMETER_BOOL,
-                description='Depth path only. Rotate camera-optical points (x-right, y-down, '
-                            'z-forward) into the body convention (x-forward, y-left, z-up) '
-                            'before the TF to output_frame. True for carla-ros-bridge camera '
-                            'frames (body-oriented). Set False if your camera TF frame is '
-                            'already the optical frame.'))
+                type=ParameterType.PARAMETER_STRING,
+                description='TF frame that carries the camera OPTICAL convention (x-right, y-down, '
+                            'z-forward) — the frame the pinhole projection actually produces points '
+                            'in. Leave EMPTY (default) when camera_info.header.frame_id is already '
+                            'the optical frame, which is the REP-103 norm for RealSense '
+                            '(camera_color_optical_frame), ZED (zed_*_camera_optical_frame), gscam, '
+                            'etc.; the node then projects, stamps with that frame and lets TF do all '
+                            'rotation — no manual axis math. Set this ONLY for drivers that publish '
+                            'a non-optical camera_info frame and no optical child (e.g. '
+                            'carla-ros-bridge, whose ego_vehicle/rgb_front is x-fwd,y-down,z-left): '
+                            'publish a static optical child of that frame (a +90 deg pitch about Y) '
+                            'and point this param at it.'))
         self.declare_parameter(
             'depth_box_thickness', 0.5,
             ParameterDescriptor(
@@ -151,7 +157,7 @@ class DepthFusionNode(BaseDetector):
         self.cluster_min_height = gp('cluster_min_height').value
         self.cluster_max_height = gp('cluster_max_height').value
         self.bounding_box_type = gp('bounding_box_type').value
-        self.apply_optical_to_body = gp('apply_optical_to_body').value
+        self.optical_frame_id = gp('optical_frame_id').value
         self.depth_box_thickness = gp('depth_box_thickness').value
         self.publish_empty_detections = gp('publish_empty_detections').value
 
@@ -177,10 +183,11 @@ class DepthFusionNode(BaseDetector):
         self._depth_to_rgb_tf = None
         self._depth_to_rgb_tf_torch = None
         # RGB camera frame → output_frame, used to place depth-projected 3D points
-        self._rgb_to_output_tf = None
+        self._optical_to_output_tf = None
         # pc → RGB projection transform
-        self._pc_to_rgb_tf = None
-        self._pc_to_rgb_tf_o3d = None
+        self._pc_to_optical_tf = None
+        self._pc_to_optical_tf_o3d = None
+        self._pc_to_optical_tf_src = None   # source frame the cached pc→rgb tf was built for
 
         # ---------------------------------------------------------------- Open3D
         if self.use_pointcloud:
@@ -363,21 +370,23 @@ class DepthFusionNode(BaseDetector):
                 self.depth_scale,
             ).cpu().numpy()
 
-        frame_id = self.output_frame or self.depth_frame_id or ''
         timestamp = depth_msg.header.stamp
-        det3d_arr = Detection3DArray()
-        det3d_arr.header.frame_id = frame_id
-        det3d_arr.header.stamp = timestamp
-        marker_arr = MarkerArray()
-
         depth_image[depth_image > self.depth_max * self.depth_scale] = 0.0
         rfx = self.rgb_camera_model.fx()
         rfy = self.rgb_camera_model.fy()
 
-        # Cache the camera-frame → output_frame transform so the 3D points land in the
-        # robot/world frame instead of the camera optical frame.
-        self._update_rgb_to_output_tf()
-        T = self._rgb_to_output_tf
+        # The pinhole projection yields points in the camera OPTICAL frame; TF carries the
+        # optical->output rotation in one shot (no manual axis swaps). If the TF isn't
+        # available yet, stamp honestly with the optical frame rather than mislabelling the
+        # optical-axis coords as output_frame.
+        self._update_optical_to_output_tf()
+        T = self._optical_to_output_tf
+        frame_id = (self.output_frame if (T is not None and self.output_frame)
+                    else self._optical_frame()) or ''
+        det3d_arr = Detection3DArray()
+        det3d_arr.header.frame_id = frame_id
+        det3d_arr.header.stamp = timestamp
+        marker_arr = MarkerArray()
 
         for i, det in enumerate(detections_msg.detections):
             bbox = (det.bbox.center.position.x, det.bbox.center.position.y,
@@ -395,15 +404,14 @@ class DepthFusionNode(BaseDetector):
             width = z_o * int(bbox[2]) / rfx       # image-plane width  (metres)
             height = z_o * int(bbox[3]) / rfy      # image-plane height (metres)
 
+            # Point is in optical axes; TF rotates optical->output in one shot.
             px, py, pz = x_o, y_o, z_o
-            if self.apply_optical_to_body:
-                # optical (x-right, y-down, z-fwd) -> body (x-fwd, y-left, z-up)
-                px, py, pz = z_o, -x_o, -y_o
             if T is not None:
                 p = T @ np.array([px, py, pz, 1.0], dtype=np.float64)
                 px, py, pz = float(p[0]), float(p[1]), float(p[2])
 
-            # Box in body/output axes: thickness along view axis, width lateral, height vertical.
+            # Box extents assume a body/world output_frame (x-fwd, y-left, z-up):
+            # thickness along view axis, width lateral, height vertical.
             sx = self.depth_box_thickness
             sy = width
             sz = height
@@ -417,18 +425,27 @@ class DepthFusionNode(BaseDetector):
         self.detection3d_depth_pub.publish(det3d_arr)
         self.marker_depth_pub.publish(marker_arr)
 
-    def _update_rgb_to_output_tf(self):
-        """Cache the RGB-camera-frame → output_frame transform (depth 3D placement)."""
-        if self._rgb_to_output_tf is not None and self.static_camera_to_robot_tf:
+    def _optical_frame(self):
+        """TF frame the pinhole projection produces points in.
+
+        Empty optical_frame_id => camera_info.header.frame_id is itself the optical
+        frame (REP-103 norm: RealSense/ZED/gscam). Otherwise the explicit optical child
+        the user published for a non-optical driver (e.g. carla-ros-bridge)."""
+        return self.optical_frame_id or self.rgb_frame_id
+
+    def _update_optical_to_output_tf(self):
+        """Cache the optical-frame → output_frame transform (depth 3D placement)."""
+        if self._optical_to_output_tf is not None and self.static_camera_to_robot_tf:
             return
-        if not (self.rgb_frame_id and self.output_frame):
+        src = self._optical_frame()
+        if not (src and self.output_frame):
             return
-        if self.rgb_frame_id == self.output_frame:
-            self._rgb_to_output_tf = np.eye(4, dtype=np.float64)
+        if src == self.output_frame:
+            self._optical_to_output_tf = np.eye(4, dtype=np.float64)
             return
-        t = self.lookup_transform(self.rgb_frame_id, self.output_frame, rclpy.time.Time())
+        t = self.lookup_transform(src, self.output_frame, rclpy.time.Time())
         if t is not None:
-            self._rgb_to_output_tf = self._transform_to_matrix(t)
+            self._optical_to_output_tf = self._transform_to_matrix(t)
 
     def _update_depth_to_rgb_tf(self):
         if self._depth_to_rgb_tf is not None and self.static_camera_to_robot_tf:
@@ -496,7 +513,7 @@ class DepthFusionNode(BaseDetector):
         # TF: pc frame → output_frame (for world-space results)
         self._update_camera_to_robot_tf(pc_msg.header.stamp)
         # TF: pc/output frame → RGB frame (for 2D projection)
-        self._update_pc_to_rgb_tf()
+        self._update_pc_to_optical_tf()
 
         _, _, points_np = unpack_pointcloud_message(pc_msg, fields=('x', 'y', 'z'))
         if points_np is None or len(points_np) == 0:
@@ -511,7 +528,7 @@ class DepthFusionNode(BaseDetector):
         # Move the cloud into output_frame BEFORE clustering so the resulting 3D centroids
         # are actually in output_frame (the header claims it). Without this the clusters
         # stay in the raw lidar frame and the published positions are offset by the
-        # lidar→robot mounting transform. _update_pc_to_rgb_tf() already projects from
+        # lidar→robot mounting transform. _update_pc_to_optical_tf() already projects from
         # output_frame when camera_to_robot_tf is available, so the 2D filter stays valid.
         if (self.camera_to_robot_tf_o3d is not None
                 and not np.allclose(self.camera_to_robot_tf, np.eye(4))):
@@ -524,11 +541,11 @@ class DepthFusionNode(BaseDetector):
         det3d_arr.header.stamp = timestamp
         marker_arr = MarkerArray()
 
-        if (self._pc_to_rgb_tf_o3d is not None
-                and not np.allclose(self._pc_to_rgb_tf, np.eye(4))):
-            pts_rgb = self.o3d_pointcloud.clone().transform(self._pc_to_rgb_tf_o3d).point.positions
+        if (self._pc_to_optical_tf_o3d is not None
+                and not np.allclose(self._pc_to_optical_tf, np.eye(4))):
+            pts_optical = self.o3d_pointcloud.clone().transform(self._pc_to_optical_tf_o3d).point.positions
         else:
-            pts_rgb = self.o3d_pointcloud.point.positions
+            pts_optical = self.o3d_pointcloud.point.positions
 
         for i, det in enumerate(detections_msg.detections):
             bbox = (det.bbox.center.position.x, det.bbox.center.position.y,
@@ -536,7 +553,7 @@ class DepthFusionNode(BaseDetector):
             conf = det.results[0].hypothesis.score if det.results else 0.0
             cls_name = det.results[0].hypothesis.class_id if det.results else ''
 
-            result = self._project_pointcloud(bbox, pts_rgb)
+            result = self._project_pointcloud(bbox, pts_optical)
             if result is None:
                 continue
             x3, y3, z3, sx, sy, sz, quat = result
@@ -564,11 +581,14 @@ class DepthFusionNode(BaseDetector):
                 self.camera_to_robot_tf_o3d = o3c.Tensor(
                     self.camera_to_robot_tf, dtype=o3c.float32, device=self.o3d_device)
 
-    def _update_pc_to_rgb_tf(self):
-        """Cache the source-frame → RGB camera frame transform for 2D projection."""
-        if self._pc_to_rgb_tf is not None and self.static_camera_to_robot_tf:
-            return
-        if not self.rgb_frame_id:
+    def _update_pc_to_optical_tf(self):
+        """Cache the source-frame → camera OPTICAL frame transform for 2D projection.
+
+        Projects the cloud into the optical frame so the pinhole model below sees genuine
+        optical axes (x-right, y-down, z-fwd) — no manual swaps. The optical frame is
+        camera_info.frame_id (REP-103 norm) or the explicit optical_frame_id."""
+        tgt = self._optical_frame()
+        if not tgt:
             return
         # project from the output frame if we've already transformed the cloud, else from pc frame
         src = (self.output_frame
@@ -576,19 +596,29 @@ class DepthFusionNode(BaseDetector):
                else self.pc_frame_id)
         if not src:
             return
-        if src == self.rgb_frame_id:
-            self._pc_to_rgb_tf = np.eye(4, dtype=np.float64)
-            if OPEN3D_AVAILABLE:
-                self._pc_to_rgb_tf_o3d = o3c.Tensor(
-                    self._pc_to_rgb_tf, dtype=o3c.float32, device=self.o3d_device)
+        # Recompute when the source frame changes, even under static caching. At startup
+        # the camera→robot TF may not resolve on the first callback, so src is the raw pc
+        # frame; once it resolves the cloud is transformed into output_frame and src flips.
+        # A stale pc→optical transform then projects the wrong frame and silently drops
+        # every detection — guard on the cached src, not just non-None.
+        if (self._pc_to_optical_tf is not None and self.static_camera_to_robot_tf
+                and self._pc_to_optical_tf_src == src):
             return
-        t = self.lookup_transform(src, self.rgb_frame_id, rclpy.time.Time())
+        if src == tgt:
+            self._pc_to_optical_tf = np.eye(4, dtype=np.float64)
+            if OPEN3D_AVAILABLE:
+                self._pc_to_optical_tf_o3d = o3c.Tensor(
+                    self._pc_to_optical_tf, dtype=o3c.float32, device=self.o3d_device)
+            self._pc_to_optical_tf_src = src
+            return
+        t = self.lookup_transform(src, tgt, rclpy.time.Time())
         if t is not None:
-            self._pc_to_rgb_tf = self._transform_to_matrix(t)
-            self._pc_to_rgb_tf_o3d = o3c.Tensor(
-                self._pc_to_rgb_tf, dtype=o3c.float32, device=self.o3d_device)
+            self._pc_to_optical_tf = self._transform_to_matrix(t)
+            self._pc_to_optical_tf_o3d = o3c.Tensor(
+                self._pc_to_optical_tf, dtype=o3c.float32, device=self.o3d_device)
+            self._pc_to_optical_tf_src = src
 
-    def _project_pointcloud(self, xywh, pts_rgb):
+    def _project_pointcloud(self, xywh, pts_optical):
         """Filter 3D points inside a 2D bbox, cluster, and return the dominant cluster.
 
         Returns (x, y, z, size_x, size_y, size_z, quat) or None.
@@ -605,9 +635,11 @@ class DepthFusionNode(BaseDetector):
         img_w = self.rgb_camera_model.width
         img_h = self.rgb_camera_model.height
 
-        x_ = pts_rgb[:, 0]
-        y_ = pts_rgb[:, 1]
-        z_ = pts_rgb[:, 2]
+        # pts_optical are already in the camera OPTICAL frame (the cloud was TF'd into it),
+        # so the pinhole model applies directly: x-right, y-down, z-forward into the scene.
+        x_ = pts_optical[:, 0]
+        y_ = pts_optical[:, 1]
+        z_ = pts_optical[:, 2]
 
         mask_fwd = (z_ > 0).to(o3c.float32)
         z_denom = z_ * mask_fwd + (1.0 - mask_fwd)
@@ -755,8 +787,12 @@ class DepthFusionNode(BaseDetector):
                 pass
             elif param.name == 'publish_empty_detections' and param.type_ == Parameter.Type.BOOL:
                 self.publish_empty_detections = param.value
-            elif param.name == 'apply_optical_to_body' and param.type_ == Parameter.Type.BOOL:
-                self.apply_optical_to_body = param.value
+            elif param.name == 'optical_frame_id' and param.type_ == Parameter.Type.STRING:
+                self.optical_frame_id = param.value
+                # invalidate cached transforms that depended on the old optical frame
+                self._optical_to_output_tf = None
+                self._pc_to_optical_tf = None
+                self._pc_to_optical_tf_src = None
             elif param.name == 'depth_box_thickness' and param.type_ == Parameter.Type.DOUBLE:
                 self.depth_box_thickness = param.value
         return result

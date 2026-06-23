@@ -881,7 +881,7 @@ def launch_setup(context, *args, **kwargs):
                     'fps': int(fps_list[0]) if fps_list else 30,
                     'input_image_topic_is_compressed': [False] * num_cameras_int,
                     'qos': 'SENSOR_DATA' if use_sensor_data_qos_str.lower() == "true" else 'SYSTEM_DEFAULT',
-                    'model_path': "yolo11m-seg.engine",  # rtdetr-l.pt, yolo11m-seg.engine
+                    'model_path': model_path_str,  # follow the launch model_path arg (default yolo11x.engine, present in repo)
                     'export_model_format': '',
                     'use_gpu': True,
                     'show_image': False,
