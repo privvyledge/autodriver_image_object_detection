@@ -102,6 +102,21 @@ class DepthFusionNode(BaseDetector):
         self.declare_parameter('cluster_max_height', 2.0)
         self.declare_parameter('bounding_box_type', 'AABB')
         self.declare_parameter(
+            'apply_optical_to_body', True,
+            ParameterDescriptor(
+                type=ParameterType.PARAMETER_BOOL,
+                description='Depth path only. Rotate camera-optical points (x-right, y-down, '
+                            'z-forward) into the body convention (x-forward, y-left, z-up) '
+                            'before the TF to output_frame. True for carla-ros-bridge camera '
+                            'frames (body-oriented). Set False if your camera TF frame is '
+                            'already the optical frame.'))
+        self.declare_parameter(
+            'depth_box_thickness', 0.5,
+            ParameterDescriptor(
+                type=ParameterType.PARAMETER_DOUBLE,
+                description='Depth path only. Box extent (m) along the camera view axis. '
+                            'Monocular depth gives no object length, so this is a fixed guess.'))
+        self.declare_parameter(
             'publish_empty_detections', True,
             ParameterDescriptor(
                 type=ParameterType.PARAMETER_BOOL,
@@ -136,6 +151,8 @@ class DepthFusionNode(BaseDetector):
         self.cluster_min_height = gp('cluster_min_height').value
         self.cluster_max_height = gp('cluster_max_height').value
         self.bounding_box_type = gp('bounding_box_type').value
+        self.apply_optical_to_body = gp('apply_optical_to_body').value
+        self.depth_box_thickness = gp('depth_box_thickness').value
         self.publish_empty_detections = gp('publish_empty_detections').value
 
         # ---------------------------------------------------------------- device
@@ -159,6 +176,8 @@ class DepthFusionNode(BaseDetector):
         # depth → RGB alignment transform (cached separately from pc → RGB)
         self._depth_to_rgb_tf = None
         self._depth_to_rgb_tf_torch = None
+        # RGB camera frame → output_frame, used to place depth-projected 3D points
+        self._rgb_to_output_tf = None
         # pc → RGB projection transform
         self._pc_to_rgb_tf = None
         self._pc_to_rgb_tf_o3d = None
@@ -354,6 +373,12 @@ class DepthFusionNode(BaseDetector):
         depth_image[depth_image > self.depth_max * self.depth_scale] = 0.0
         rfx = self.rgb_camera_model.fx()
         rfy = self.rgb_camera_model.fy()
+
+        # Cache the camera-frame → output_frame transform so the 3D points land in the
+        # robot/world frame instead of the camera optical frame.
+        self._update_rgb_to_output_tf()
+        T = self._rgb_to_output_tf
+
         for i, det in enumerate(detections_msg.detections):
             bbox = (det.bbox.center.position.x, det.bbox.center.position.y,
                     det.bbox.size_x, det.bbox.size_y)
@@ -363,18 +388,47 @@ class DepthFusionNode(BaseDetector):
             xyz = project_depth_to_3d(bbox, depth_image, self.rgb_camera_model, self.depth_scale)
             if xyz is None:
                 continue
-            x3, y3, z3 = xyz
-            sx = z3 * int(bbox[2]) / rfx
-            sy = z3 * int(bbox[3]) / rfy
+            # project_depth_to_3d returns the point in camera-OPTICAL axes
+            # (x-right, y-down, z-forward). Lateral/vertical box extents come straight
+            # from the image-plane bbox at range z.
+            x_o, y_o, z_o = xyz
+            width = z_o * int(bbox[2]) / rfx       # image-plane width  (metres)
+            height = z_o * int(bbox[3]) / rfy      # image-plane height (metres)
+
+            px, py, pz = x_o, y_o, z_o
+            if self.apply_optical_to_body:
+                # optical (x-right, y-down, z-fwd) -> body (x-fwd, y-left, z-up)
+                px, py, pz = z_o, -x_o, -y_o
+            if T is not None:
+                p = T @ np.array([px, py, pz, 1.0], dtype=np.float64)
+                px, py, pz = float(p[0]), float(p[1]), float(p[2])
+
+            # Box in body/output axes: thickness along view axis, width lateral, height vertical.
+            sx = self.depth_box_thickness
+            sy = width
+            sz = height
 
             det3d_arr.detections.append(
-                self._make_detection3d(x3, y3, z3, sx, sy, 0.0, conf, cls_name, frame_id=frame_id))
+                self._make_detection3d(px, py, pz, sx, sy, sz, conf, cls_name, frame_id=frame_id))
             marker_arr.markers.append(
-                create_marker(i, x3, y3, z3, sx, sy, 0.0, frame_id,
+                create_marker(i, px, py, pz, sx, sy, sz, frame_id,
                               timestamp=timestamp, rgba=[1.0, 0.0, 0.0, 0.5]))
 
         self.detection3d_depth_pub.publish(det3d_arr)
         self.marker_depth_pub.publish(marker_arr)
+
+    def _update_rgb_to_output_tf(self):
+        """Cache the RGB-camera-frame → output_frame transform (depth 3D placement)."""
+        if self._rgb_to_output_tf is not None and self.static_camera_to_robot_tf:
+            return
+        if not (self.rgb_frame_id and self.output_frame):
+            return
+        if self.rgb_frame_id == self.output_frame:
+            self._rgb_to_output_tf = np.eye(4, dtype=np.float64)
+            return
+        t = self.lookup_transform(self.rgb_frame_id, self.output_frame, rclpy.time.Time())
+        if t is not None:
+            self._rgb_to_output_tf = self._transform_to_matrix(t)
 
     def _update_depth_to_rgb_tf(self):
         if self._depth_to_rgb_tf is not None and self.static_camera_to_robot_tf:
@@ -453,6 +507,15 @@ class DepthFusionNode(BaseDetector):
             points_np, dtype=o3c.Dtype.Float32, device=self.o3d_device)
         if self.o3d_pointcloud.is_empty():
             return
+
+        # Move the cloud into output_frame BEFORE clustering so the resulting 3D centroids
+        # are actually in output_frame (the header claims it). Without this the clusters
+        # stay in the raw lidar frame and the published positions are offset by the
+        # lidar→robot mounting transform. _update_pc_to_rgb_tf() already projects from
+        # output_frame when camera_to_robot_tf is available, so the 2D filter stays valid.
+        if (self.camera_to_robot_tf_o3d is not None
+                and not np.allclose(self.camera_to_robot_tf, np.eye(4))):
+            self.o3d_pointcloud = self.o3d_pointcloud.transform(self.camera_to_robot_tf_o3d)
 
         frame_id = self.output_frame or self.pc_frame_id or ''
         timestamp = pc_msg.header.stamp
@@ -692,6 +755,10 @@ class DepthFusionNode(BaseDetector):
                 pass
             elif param.name == 'publish_empty_detections' and param.type_ == Parameter.Type.BOOL:
                 self.publish_empty_detections = param.value
+            elif param.name == 'apply_optical_to_body' and param.type_ == Parameter.Type.BOOL:
+                self.apply_optical_to_body = param.value
+            elif param.name == 'depth_box_thickness' and param.type_ == Parameter.Type.DOUBLE:
+                self.depth_box_thickness = param.value
         return result
 
     # ------------------------------------------------------------ cleanup

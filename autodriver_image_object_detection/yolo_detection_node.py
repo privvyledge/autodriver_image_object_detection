@@ -533,7 +533,7 @@ class ImageObstacleDetectionNode(Node):
                         parameter_namespace=self.pointcloud_preprocessor_namespace)
                 # to get the dict of all parameters: self.pointcloud_preprocessor.get_parameters_by_prefix(prefix=self.pointcloud_preprocessor_namespace.rstrip('.'))
                 self.pointcloud_preprocessor_namespace_param = f'{self.pointcloud_preprocessor_namespace}.'
-                self.pointcloud_preprocessor.set_parameters(
+                preprocessor_params = (
                         [
                             Parameter(f'{self.pointcloud_preprocessor_namespace_param}use_gpu', Parameter.Type.BOOL,
                                       self.use_gpu),
@@ -569,6 +569,15 @@ class ImageObstacleDetectionNode(Node):
                                       self.remove_ground),
                         ]
                 )
+                # The child PointcloudPreprocessorNode may not have declared these namespaced
+                # params (e.g. when constructed with enabled=False), so a plain set_parameters()
+                # raises ParameterNotDeclaredException. Declare-if-missing then set, so config
+                # works regardless of the preprocessor's declaration timing.
+                for _pp in preprocessor_params:
+                    if self.pointcloud_preprocessor.has_parameter(_pp.name):
+                        self.pointcloud_preprocessor.set_parameters([_pp])
+                    else:
+                        self.pointcloud_preprocessor.declare_parameter(_pp.name, _pp.value)
 
         self.previous_time = time.time()
         self.previous_callback_time = None
@@ -582,6 +591,18 @@ class ImageObstacleDetectionNode(Node):
             self.get_logger().warn(f"Error while fusing the model: {e}. "
                                    f"This usually occurs if not using a pytorch model (.pt), "
                                    f"e.g a TensorRT model (.engine)")
+
+        # A fused .pt model moved to GPU keeps fp32 weights, while half=True feeds fp16
+        # inputs — this mismatch causes a "Half != float" runtime error. Cast weights to
+        # fp16 so they match. Engines are already fp16 so this path is .pt-only.
+        if (self.torch_device.type != 'cpu' and self.half_precision
+                and self.model_path.endswith('.pt')):
+            try:
+                self.model.model.half()
+            except Exception as e:
+                self.get_logger().warn(
+                    f'Could not cast .pt model to fp16 ({e}); falling back to fp32 inference.')
+                self.inference_dict['half'] = False
 
         # Initialize TF buffer and listener
         self.tf_buffer = Buffer()

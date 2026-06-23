@@ -82,6 +82,16 @@ class BaseDetector(Node):
             ),
         )
         self.declare_parameter('export_model_format', d.get('export_model_format', ''))
+        self.declare_parameter(
+            'export_and_exit',
+            d.get('export_and_exit', False),
+            ParameterDescriptor(
+                type=ParameterType.PARAMETER_BOOL,
+                description='If True, shut the node down right after a model export/auto-export '
+                            'completes instead of continuing to run inference. Useful for a '
+                            'dedicated "build the .engine" pass.',
+            ),
+        )
         self.declare_parameter('half_precision', d.get('half_precision', True))
         self.declare_parameter('conf_thresh', d.get('conf_thresh', 0.55))
         self.declare_parameter('iou_thresh', d.get('iou_thresh', 0.55))
@@ -141,6 +151,7 @@ class BaseDetector(Node):
         self.publish_debug_image = gp('publish_debug_image').get_parameter_value().bool_value
         self.model_path = gp('model_path').get_parameter_value().string_value
         self.export_model_format = gp('export_model_format').get_parameter_value().string_value
+        self.export_and_exit = gp('export_and_exit').get_parameter_value().bool_value
         self.half_precision = gp('half_precision').get_parameter_value().bool_value
         self.conf_thresh = gp('conf_thresh').get_parameter_value().double_value
         self.iou_thresh = gp('iou_thresh').get_parameter_value().double_value
@@ -200,6 +211,7 @@ class BaseDetector(Node):
         model_class = self._select_model_class()
         model_path = Path(self.model_path)
         extra = self._extra_export_kwargs()
+        did_export = False
 
         if self.export_model_format:
             self.get_logger().info(f'Exporting model to {self.export_model_format}...')
@@ -214,6 +226,7 @@ class BaseDetector(Node):
             )
             self.model_path = str(model_path.with_suffix('.' + self.export_model_format))
             model_path = Path(self.model_path)
+            did_export = True
             self.get_logger().info(f'Export complete: {self.model_path}')
 
         if model_path.suffix in ('.engine', '.onnx'):
@@ -223,9 +236,14 @@ class BaseDetector(Node):
             else:
                 try:
                     probe_model = model_class(str(model_path))
-                    # Trigger the actual deserialisation/load by accessing names
+                    # Trigger the actual deserialisation/load by accessing names.
+                    # NOTE: do NOT treat `probe_model.model` being a str path as a failure.
+                    # Ultralytics keeps the weights path as a string for exported formats
+                    # (.engine/.onnx) until the inference backend is lazily initialised, so
+                    # that check fired on EVERY valid engine and forced a needless ~5-min
+                    # re-export on every startup.
                     names = probe_model.names
-                    if names is None or isinstance(probe_model.model, str):
+                    if not names:
                         needs_export = True
                 except Exception as e:
                     self.get_logger().warn(f'Failed to probe {model_path}: {e}. Will attempt to re-export.')
@@ -243,6 +261,11 @@ class BaseDetector(Node):
                     device=self.device,
                     **extra,
                 )
+                did_export = True
+
+        if did_export and self.export_and_exit:
+            self.get_logger().info('export_and_exit=True — export finished; shutting node down.')
+            raise SystemExit(0)
 
         self.model = model_class(str(model_path))
         try:
@@ -264,6 +287,19 @@ class BaseDetector(Node):
             self.get_logger().warn(f'Model fuse skipped (normal for non-.pt): {e}')
 
         self._setup_inference_dict()
+
+        # A fused .pt model moved to GPU keeps fp32 weights, while half=True feeds fp16
+        # input — raising "mat1 and mat2 have different dtype: Half != float". Match the
+        # weight dtype to the requested precision for the PyTorch path (engines/onnx are
+        # already exported at the right precision and need no change).
+        if (self.use_gpu and self.half_precision
+                and Path(self.model_path).suffix == '.pt'):
+            try:
+                self.model.model.half()
+            except Exception as e:
+                self.get_logger().warn(
+                    f'Could not cast .pt model to fp16 ({e}); falling back to fp32 inference.')
+                self.inference_dict['half'] = False
 
         if self.track_2d and self.plot_tracks:
             self.track_history: dict = defaultdict(list)
