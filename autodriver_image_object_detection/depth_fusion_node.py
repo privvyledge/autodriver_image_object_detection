@@ -62,6 +62,10 @@ class DepthFusionNode(BaseDetector):
     Does NOT run YOLO inference — pairs with single_stream_detector or any 2D node.
     """
 
+    # Floor for the measured depth-path view-axis box extent so a flat/degenerate
+    # depth spread still yields a visible (non-zero) box.
+    MIN_DEPTH_THICKNESS = 0.2
+
     def __init__(self):
         super().__init__('depth_fusion_node')
 
@@ -108,20 +112,24 @@ class DepthFusionNode(BaseDetector):
                 description='TF frame that carries the camera OPTICAL convention (x-right, y-down, '
                             'z-forward) — the frame the pinhole projection actually produces points '
                             'in. Leave EMPTY (default) when camera_info.header.frame_id is already '
-                            'the optical frame, which is the REP-103 norm for RealSense '
+                            'the optical frame: the REP-103 norm for RealSense '
                             '(camera_color_optical_frame), ZED (zed_*_camera_optical_frame), gscam, '
-                            'etc.; the node then projects, stamps with that frame and lets TF do all '
-                            'rotation — no manual axis math. Set this ONLY for drivers that publish '
-                            'a non-optical camera_info frame and no optical child (e.g. '
-                            'carla-ros-bridge, whose ego_vehicle/rgb_front is x-fwd,y-down,z-left): '
-                            'publish a static optical child of that frame (a +90 deg pitch about Y) '
-                            'and point this param at it.'))
+                            'AND carla-ros-bridge (verified: ego_vehicle->rgb_front is RPY '
+                            '[-90,0,-90] = X-right,Y-down,Z-forward; CARLA bakes the optical '
+                            'orientation into the camera frame rather than shipping a separate '
+                            '_optical child). The node then projects, stamps with that frame and '
+                            'lets TF do all rotation — no manual axis math, no static transform. '
+                            'Set this ONLY for a non-compliant driver whose camera_info frame is a '
+                            'BODY frame (x-fwd,y-left,z-up) with no optical child: publish a static '
+                            'optical child (body->optical = RPY [-90,0,-90]) and point this at it.'))
         self.declare_parameter(
-            'depth_box_thickness', 0.5,
+            'depth_box_thickness', 4.0,
             ParameterDescriptor(
                 type=ParameterType.PARAMETER_DOUBLE,
-                description='Depth path only. Box extent (m) along the camera view axis. '
-                            'Monocular depth gives no object length, so this is a fixed guess.'))
+                description='Depth path only. UPPER BOUND (m) on the view-axis box extent. The '
+                            'extent is measured from the ROI depth spread (10-90th pct); this caps '
+                            'it (~a large vehicle length) so background bleed in the bbox-only ROI '
+                            "can't make an absurd box. Floored at MIN_DEPTH_THICKNESS."))
         self.declare_parameter(
             'publish_empty_detections', True,
             ParameterDescriptor(
@@ -398,9 +406,10 @@ class DepthFusionNode(BaseDetector):
             if xyz is None:
                 continue
             # project_depth_to_3d returns the point in camera-OPTICAL axes
-            # (x-right, y-down, z-forward). Lateral/vertical box extents come straight
-            # from the image-plane bbox at range z.
-            x_o, y_o, z_o = xyz
+            # (x-right, y-down, z-forward), the centroid range z_o, and z_ext = the
+            # view-axis depth spread. Lateral/vertical extents come from the image-plane
+            # bbox at range z_o.
+            x_o, y_o, z_o, z_ext = xyz
             width = z_o * int(bbox[2]) / rfx       # image-plane width  (metres)
             height = z_o * int(bbox[3]) / rfy      # image-plane height (metres)
 
@@ -410,9 +419,15 @@ class DepthFusionNode(BaseDetector):
                 p = T @ np.array([px, py, pz, 1.0], dtype=np.float64)
                 px, py, pz = float(p[0]), float(p[1]), float(p[2])
 
+            # View-axis (depth) extent is MEASURED from the depth spread, floored so the
+            # box stays visible and capped by depth_box_thickness — an upper bound (~a
+            # large vehicle's length) so background bleed in the bbox-only ROI can't
+            # produce an absurd box. A mask path (future) would tighten z_ext directly.
+            thickness = min(max(z_ext, self.MIN_DEPTH_THICKNESS), self.depth_box_thickness)
+
             # Box extents assume a body/world output_frame (x-fwd, y-left, z-up):
             # thickness along view axis, width lateral, height vertical.
-            sx = self.depth_box_thickness
+            sx = thickness
             sy = width
             sz = height
 

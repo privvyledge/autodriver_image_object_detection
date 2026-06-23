@@ -113,7 +113,11 @@ def project_depth_to_3d(bbox_xywh, depth_image: np.ndarray, camera_model, depth_
             only within the segmentation mask instead of the full bbox.
 
     Returns:
-        (x3d, y3d, z3d) in the camera frame, or None on failure.
+        (x3d, y3d, z3d, z_extent) in the camera (optical) frame, or None on failure.
+        z3d is the robust centroid range (median); z_extent is the view-axis depth
+        spread (10-90th percentile span) the caller can use as a measured box depth.
+        Percentiles, not min/max, so background pixels bleeding into a bbox-only ROI
+        don't blow up the extent (mask ROIs are already tight).
     """
     cx, cy = int(bbox_xywh[0]), int(bbox_xywh[1])
     w, h = int(bbox_xywh[2]), int(bbox_xywh[3])
@@ -133,14 +137,17 @@ def project_depth_to_3d(bbox_xywh, depth_image: np.ndarray, camera_model, depth_
         roi = depth_image[v0:v1, u0:u1]
 
     roi_m = roi.astype(np.float32) / depth_scale
-    valid = roi_m[roi_m > 0]
+    valid = roi_m[np.isfinite(roi_m) & (roi_m > 0)]
     if valid.size == 0:
         return None
 
-    z = float(np.median(valid))
+    z = float(np.median(valid))                       # robust centroid range
+    z_lo = float(np.percentile(valid, 10))
+    z_hi = float(np.percentile(valid, 90))
+    z_extent = max(z_hi - z_lo, 0.0)                  # view-axis depth spread
     ray = camera_model.projectPixelTo3dRay((cx, cy))
     scale = z / ray[2]
-    return float(ray[0] * scale), float(ray[1] * scale), z
+    return float(ray[0] * scale), float(ray[1] * scale), z, z_extent
 
 
 def cv2_bitwise_and_depth(depth_image: np.ndarray, mask: np.ndarray) -> np.ndarray:
