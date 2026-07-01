@@ -117,8 +117,9 @@ from derived_object_msgs.msg import Object, ObjectArray
 from shape_msgs.msg import SolidPrimitive
 try:
     from nav2_dynamic_msgs.msg import Obstacle, ObstacleArray
+    NAV2_DYNAMIC_MSGS_AVAILABLE = True
 except ImportError:
-    print("nav2_dynamic_msgs not found. ")
+    NAV2_DYNAMIC_MSGS_AVAILABLE = False
 import tf2_ros
 from tf2_ros import TransformBroadcaster, TransformListener, Buffer, LookupException, ConnectivityException, \
     ExtrapolationException
@@ -283,9 +284,13 @@ class ImageObstacleDetectionNode(Node):
         self.declare_parameter('cluster_min_height', 0.1)  # min height of cluster
         self.declare_parameter('cluster_max_height', 2.0)  # max height of cluster
         self.declare_parameter("bounding_box_type", "AABB")  # AABB or OBB
+        self.declare_parameter('publish_object_array', True)
+        self.declare_parameter('publish_obstacle_array', True)
 
         # Get parameters
         self.use_sim_time = self.get_parameter('use_sim_time').get_parameter_value().bool_value
+        self.publish_object_array = self.get_parameter('publish_object_array').get_parameter_value().bool_value
+        self.publish_obstacle_array = self.get_parameter('publish_obstacle_array').get_parameter_value().bool_value
         self.input_image_topic = self.get_parameter('input_image_topic').value
         self.input_camera_info_topic = self.get_parameter('input_camera_info_topic').value
         self.input_image_topic_is_compressed = self.get_parameter('input_image_topic_is_compressed').value
@@ -715,16 +720,20 @@ class ImageObstacleDetectionNode(Node):
         self.detection_results_pub = self.create_publisher(Detection2DArray, self.detection_results_topic,
                                                            self.queue_size)
 
-        self.object_array_pub = self.create_publisher(
-                ObjectArray,
-                'yolo/objects',
-                self.queue_size
-        )
+        if self.publish_object_array:
+            self.object_array_pub = self.create_publisher(
+                    ObjectArray,
+                    'yolo/objects',
+                    self.queue_size
+            )
 
-        try:
-            self.obstacle_detection_pub = self.create_publisher(ObstacleArray, 'yolo/obstacles', qos_profile)
-        except NameError:
-            pass
+        self._nav2_warned = False
+        if self.publish_obstacle_array:
+            if NAV2_DYNAMIC_MSGS_AVAILABLE:
+                self.obstacle_detection_pub = self.create_publisher(ObstacleArray, 'yolo/obstacles', qos_profile)
+            else:
+                self.get_logger().warning("nav2_dynamic_msgs not available; nav2 ObstacleArray output disabled")
+                self._nav2_warned = True
 
         if self.publish_debug_image:
             if self.detection_image_topic:
@@ -1052,12 +1061,11 @@ class ImageObstacleDetectionNode(Node):
         objects_msg.header.stamp = self.msg_metadata['rgb'].get('msg_timestamp')   # self.get_clock().now().to_msg()
         objects_msg.header.frame_id = self.frame_ids['rgb']
 
-        try:
+        if self.publish_obstacle_array and NAV2_DYNAMIC_MSGS_AVAILABLE:
             obstacle_msg = ObstacleArray()
             obstacle_msg.header.stamp = self.msg_metadata['rgb'].get('msg_timestamp')  # self.get_clock().now().to_msg()
             obstacle_msg.header.frame_id = self.frame_ids['rgb']
-        except NameError as e:
-            self.get_logger().error(f'ObstacleArray message not found.')
+        else:
             obstacle_msg = None
 
         mask_img = None
@@ -1251,9 +1259,10 @@ class ImageObstacleDetectionNode(Node):
                                     rgba=[0.0, 1.0, 0.0, 0.5]))
 
             # publish messages
-            self.object_array_pub.publish(objects_msg)
+            if self.publish_object_array and hasattr(self, 'object_array_pub'):
+                self.object_array_pub.publish(objects_msg)
 
-            if obstacle_msg is not None:
+            if obstacle_msg is not None and hasattr(self, 'obstacle_detection_pub'):
                 self.obstacle_detection_pub.publish(obstacle_msg)
 
             if self.project_to_3d:
@@ -1917,7 +1926,21 @@ class ImageObstacleDetectionNode(Node):
 
         # Iterate over each parameter in this node
         for param in params:
-            if param.name == 'publish_debug_image' and param.type_ == Parameter.Type.BOOL:
+            if param.name == 'publish_object_array' and param.type_ == Parameter.Type.BOOL:
+                self.publish_object_array = param.value
+                if self.publish_object_array and not hasattr(self, 'object_array_pub'):
+                    self.object_array_pub = self.create_publisher(ObjectArray, 'yolo/objects', self.queue_size)
+            elif param.name == 'publish_obstacle_array' and param.type_ == Parameter.Type.BOOL:
+                self.publish_obstacle_array = param.value
+                if self.publish_obstacle_array:
+                    if NAV2_DYNAMIC_MSGS_AVAILABLE:
+                        if not hasattr(self, 'obstacle_detection_pub'):
+                            self.obstacle_detection_pub = self.create_publisher(ObstacleArray, 'yolo/obstacles', self.queue_size)
+                    else:
+                        if not getattr(self, '_nav2_warned', False):
+                            self.get_logger().warning("nav2_dynamic_msgs not available; nav2 ObstacleArray output disabled")
+                            self._nav2_warned = True
+            elif param.name == 'publish_debug_image' and param.type_ == Parameter.Type.BOOL:
                 self.publish_debug_image = param.value
             elif param.name == 'model_path' and param.type_ == Parameter.Type.STRING:
                 self.model_path = param.value
