@@ -44,15 +44,15 @@ docker compose \
 
 These control how the ego vehicle moves in the sim; set them alongside `OBJECTS_DEFINITION_FILE` in the commands above.
 
-| Var | Default used above | Meaning |
+For **perception testing**, use `LAUNCH_BUILTIN_AGENT=True` + `START_GLOBAL_PLANNER_CARLA=True` + `VIEW=True` together (planner + waypoint-follower drives the ego vehicle). `LAUNCH_ACTUATION` and `PUBLISH_TWIST` are **not needed** for perception tests — they only apply to separate waypoint-following/MPC tests.
+
+| Var | Value for perception tests | Meaning |
 | :--- | :--- | :--- |
 | `LAUNCH_BUILTIN_AGENT` | `True` | Use CARLA's built-in autopilot agent to drive the ego vehicle. |
-| `START_GLOBAL_PLANNER_CARLA` | `True` (Option A) | Run the global route planner, which generates waypoints from a goal pose. |
-| `LAUNCH_ACTUATION` | not set (`True` in prior notes) | Enable the actuation/control stack that follows waypoints. |
-| `PUBLISH_TWIST` | not set (`False` in prior notes) | Publish `Twist` commands instead of / in addition to actuation commands. |
-
-> [!WARNING] TBD — confirm intended combination
-> `LAUNCH_BUILTIN_AGENT=True` (autopilot drives) and `START_GLOBAL_PLANNER_CARLA=True` (planner drives from a goal) are two different driving sources — not clear from prior notes whether both are meant to run together or these are alternatives. `LAUNCH_ACTUATION`/`PUBLISH_TWIST` weren't included in the working commands at all; add them only if you're testing the waypoint-follower path instead of the built-in agent.
+| `START_GLOBAL_PLANNER_CARLA` | `True` | Run the global route planner, which generates waypoints from a goal pose; used together with `LAUNCH_BUILTIN_AGENT` (planner + waypoint-follower). |
+| `VIEW` | `True` | Enable the simulator/manual-control view window. |
+| `LAUNCH_ACTUATION` | not set | Waypoint-following/MPC tests only — not used here. |
+| `PUBLISH_TWIST` | not set | Waypoint-following/MPC tests only — not used here. |
 
 ### Useful Debugging Commands
 ```bash
