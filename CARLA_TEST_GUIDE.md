@@ -7,10 +7,12 @@ This guide outlines the procedures for building, running, and verifying the 2D/3
 ## 1. Prerequisites & Environment Setup
 
 ### X11 Forwarding & Docker Compose
-Start the CARLA simulator, ROS bridge, and custom nodes with an object definition file mounted at `/config/`.
+Start the CARLA simulator, ROS bridge, and custom nodes using `obstacles.json` as the object definition configuration.
 
-> [!WARNING] TBD — confirm which file is current
-> Prior notes reference three different filenames (`obstacles.json`, `objects.json`, `objects_record.json`) without saying which is authoritative. `obstacles.json` is used below as a placeholder — swap in the correct one before relying on this guide.
+> [!NOTE] `OBJECTS_DEFINITION_FILE` options
+> - **`obstacles.json`** (used below) — includes extra cars; the correct choice for perception testing in this repo.
+> - `objects.json` — only the ego car, no other vehicles; not suitable for perception tests.
+> - `objects_record.json` — ego car + odometry + traffic lights but no obstacles; for recording an obstacle-free waypoint trajectory for MPC (since CARLA's built-in obstacle avoidance isn't reliable), not for perception testing.
 
 > [!IMPORTANT]
 > If you are testing over SSH or Wireguard, run the setup script **without** `--up` first to configure host-side X11 access controls before running any container compose commands.
