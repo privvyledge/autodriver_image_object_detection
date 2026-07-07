@@ -911,8 +911,14 @@ class ImageObstacleDetectionNode(Node):
                                                              self.msg_metadata['rgb'].get('inverse_conversion'))
                         color_mask_img = cv2.bitwise_and(cv_image_inverted, cv_image_inverted, mask=mask_img)
                         if self.show_image:
-                            cv2.imshow("color_mask_image", color_mask_img)
-                            cv2.waitKey(1)
+                            try:
+                                cv2.imshow("color_mask_image", color_mask_img)
+                                cv2.waitKey(1)
+                            except Exception as e:
+                                self.get_logger().warning(
+                                    f"Could not display window 'color_mask_image' (likely headless environment): {e}. Disabling show_image."
+                                )
+                                self.show_image = False
 
                         if self.image_message_format in ("compressed", "packet"):
                             color_mask_image_msg = self.bridge.cv2_to_compressed_imgmsg(
@@ -1113,9 +1119,15 @@ class ImageObstacleDetectionNode(Node):
                     # im_gpu=None,  # torch tensor image to overlay detections on. This is faster since it does not need to be transferred to GPU
             )
             if self.show_image:
-                # Visualize the results on the frame
-                cv2.imshow("image", self.detection_image)
-                cv2.waitKey(1)
+                try:
+                    # Visualize the results on the frame
+                    cv2.imshow("image", self.detection_image)
+                    cv2.waitKey(1)
+                except Exception as e:
+                    self.get_logger().warning(
+                        f"Could not display window 'image' (likely headless environment): {e}. Disabling show_image."
+                    )
+                    self.show_image = False
 
             # use result.cpu().numpy()  # to move all at once. or result.to(device="cpu", dtype=torch.float32)
             result = result.cpu()
@@ -1155,8 +1167,14 @@ class ImageObstacleDetectionNode(Node):
                 # masks_xy = masks.xy  # list of size n, each item (ndarray) of size [m, 2], where m is the number of pixels per object mask
                 mask_img = (torch.sum(masks.data, dim=0).cpu().numpy() * 255).astype(np.uint8)
                 if self.show_image:
-                    cv2.imshow("masked_image", mask_img)
-                    cv2.waitKey(1)
+                    try:
+                        cv2.imshow("masked_image", mask_img)
+                        cv2.waitKey(1)
+                    except Exception as e:
+                        self.get_logger().warning(
+                            f"Could not display window 'masked_image' (likely headless environment): {e}. Disabling show_image."
+                        )
+                        self.show_image = False
 
             else:
                 # create a list of Nones
@@ -1974,7 +1992,10 @@ class ImageObstacleDetectionNode(Node):
             elif param.name == 'show_image' and param.type_ == Parameter.Type.BOOL:
                 self.show_image = param.value
                 if not self.show_image:
-                    cv2.destroyAllWindows()
+                    try:
+                        cv2.destroyAllWindows()
+                    except Exception:
+                        pass
             elif param.name == 'use_image_dimensions' and param.type_ == Parameter.Type.BOOL:
                 self.use_image_dimensions = param.value
             elif param.name == 'image_dimensions' and param.type_ == Parameter.Type.INTEGER_ARRAY:
@@ -2060,7 +2081,10 @@ class ImageObstacleDetectionNode(Node):
 
     def destroy_node(self):
         # close OpenCV windows
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
         # the reference to the model
         del self.model
         # clear the cuda cache

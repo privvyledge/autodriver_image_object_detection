@@ -208,8 +208,14 @@ class SingleStreamDetector(BaseDetector):
                             cv_image_inv = cv2.cvtColor(cv_image, inverse_conversion)
                         color_mask = cv2.bitwise_and(cv_image_inv, cv_image_inv, mask=mask_img)
                         if self.show_image:
-                            cv2.imshow('color_mask_image', color_mask)
-                            cv2.waitKey(1)
+                            try:
+                                cv2.imshow('color_mask_image', color_mask)
+                                cv2.waitKey(1)
+                            except Exception as e:
+                                self.get_logger().warning(
+                                    f"Could not display window 'color_mask_image' (likely headless environment): {e}. Disabling show_image."
+                                )
+                                self.show_image = False
 
                         if self.image_message_format in ('compressed', 'packet'):
                             cmask_msg = self.bridge.cv2_to_compressed_imgmsg(

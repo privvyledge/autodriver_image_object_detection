@@ -436,8 +436,14 @@ class BaseDetector(Node):
             if render else None
         )
         if self.show_image:
-            cv2.imshow('detection', detection_image)
-            cv2.waitKey(1)
+            try:
+                cv2.imshow('detection', detection_image)
+                cv2.waitKey(1)
+            except Exception as e:
+                self.get_logger().warning(
+                    f"Could not display window 'detection' (likely headless environment): {e}. Disabling show_image."
+                )
+                self.show_image = False
 
         mask_img = None
         boxes = result.boxes.cpu()
@@ -448,8 +454,14 @@ class BaseDetector(Node):
         if result.masks is not None and render:
             mask_img = (torch.sum(result.masks.data, dim=0).cpu().numpy() * 255).astype(np.uint8)
             if self.show_image:
-                cv2.imshow('mask', mask_img)
-                cv2.waitKey(1)
+                try:
+                    cv2.imshow('mask', mask_img)
+                    cv2.waitKey(1)
+                except Exception as e:
+                    self.get_logger().warning(
+                        f"Could not display window 'mask' (likely headless environment): {e}. Disabling show_image."
+                    )
+                    self.show_image = False
 
         track_ids = None
         if self.track_2d and boxes.is_track and boxes.id is not None:
@@ -517,7 +529,10 @@ class BaseDetector(Node):
             elif name == 'show_image' and ptype == Parameter.Type.BOOL:
                 self.show_image = val
                 if not val:
-                    cv2.destroyAllWindows()
+                    try:
+                        cv2.destroyAllWindows()
+                    except Exception:
+                        pass
             elif name == 'use_image_dimensions' and ptype == Parameter.Type.BOOL:
                 self.use_image_dimensions = val
             elif name == 'image_dimensions' and ptype == Parameter.Type.INTEGER_ARRAY:
@@ -580,7 +595,10 @@ class BaseDetector(Node):
     # --------------------------------------------------------------- cleanup
 
     def destroy_node(self) -> None:
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
         if hasattr(self, 'model'):
             del self.model
         if 'cuda' in getattr(self, 'device', ''):

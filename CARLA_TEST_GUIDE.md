@@ -83,7 +83,7 @@ ros2 topic hz /carla/ego_vehicle/rgb_front/image
 
 ---
 
-## 3. Step 1: Build & Source
+## 3. Step 1: Build & Source (Git pull first to get the latest)
 
 From your ROS2 workspace root (parent of `src/`) on the native Linux host:
 
@@ -131,7 +131,7 @@ ros2 run autodriver_image_object_detection yolo_detector --ros-args \
   -p depth_scale:=1.0 \
   -p depth_max:=50.0 \
   -p output_frame:=ego_vehicle \
-  -p show_image:=true \
+  -p show_image:=false \
   -p classes:="['person','car','truck','bicycle','motorcycle']"
 ```
 *(If the `.engine` fails to load, swap model_path to a `.pt` model, e.g., `/abs/path/to/yolo11n-seg.pt`)*
@@ -167,7 +167,7 @@ ros2 run autodriver_image_object_detection yolo_detector --ros-args \
   -p cluster_tolerance:=1.0 \
   -p min_cluster_size:=5 \
   -p bounding_box_type:=AABB \
-  -p show_image:=true
+  -p show_image:=false
 ```
 
 ### Verification (Phase 2)
