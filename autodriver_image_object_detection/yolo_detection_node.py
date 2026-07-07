@@ -808,7 +808,7 @@ class ImageObstacleDetectionNode(Node):
                             self.imgsz = list(self.image_dimensions)  # [640, 640]
 
                     # (optional) resize the image
-                    if self.resize_image and self.use_image_dimensions and (
+                    if self.resize_image and (
                             (self.image_height, self.image_width) != (self.imgsz[0], self.imgsz[1])):
                         cv_image = cv2.resize(cv_image,
                                               (self.imgsz[1], self.imgsz[0]))  # , interpolation=cv2.INTER_LINEAR
@@ -865,6 +865,9 @@ class ImageObstacleDetectionNode(Node):
             # except TypeError:
             #    pass
             detection_msg, detection_image, mask_img = self.parse_results(self.results, self.headers['rgb'])
+
+            if detection_msg is None:
+                return
 
             # publish the detection array results
             self.detection_results_pub.publish(detection_msg)

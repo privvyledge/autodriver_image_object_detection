@@ -126,6 +126,8 @@ Run the detector node with pointclouds disabled. The time synchronizer will only
 ```bash
 ros2 run autodriver_image_object_detection yolo_detector --ros-args \
   -p model_path:=/home/digitalstorm/bolus_ws/Repositories/autonomous_driving_simulators/data/models/yolo11x-seg.engine \
+  -p use_image_dimensions:=false \
+  -p resize_image:=true \
   -p use_depth:=true \
   -p use_pointcloud:=false \
   -p depth_scale:=1.0 \
@@ -160,6 +162,8 @@ export LD_PRELOAD=${HOME}/sdks/open3d_install/lib/libOpen3D.so
 # Run node with pointclouds enabled
 ros2 run autodriver_image_object_detection yolo_detector --ros-args \
   -p model_path:=/home/digitalstorm/bolus_ws/Repositories/autonomous_driving_simulators/data/models/yolo11x-seg.engine \
+  -p use_image_dimensions:=false \
+  -p resize_image:=true \
   -p use_depth:=true \
   -p use_pointcloud:=true \
   -p pointcloud_topic:=carla/ego_vehicle/lidar \

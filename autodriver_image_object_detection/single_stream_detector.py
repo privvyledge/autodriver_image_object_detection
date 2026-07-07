@@ -163,7 +163,7 @@ class SingleStreamDetector(BaseDetector):
                         self.imgsz = list(self.image_dimensions)
                 self.inference_dict['imgsz'] = self.imgsz
 
-                if (self.resize_image and self.use_image_dimensions
+                if (self.resize_image
                         and (self.image_height, self.image_width) != (self.imgsz[0], self.imgsz[1])):
                     cv_image = cv2.resize(cv_image, (self.imgsz[1], self.imgsz[0]))
 
