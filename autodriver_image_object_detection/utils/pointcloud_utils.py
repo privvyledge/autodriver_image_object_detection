@@ -153,6 +153,8 @@ def project_depth_to_3d(bbox_xywh, depth_image: np.ndarray, camera_model, depth_
 def cv2_bitwise_and_depth(depth_image: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """Apply a uint8 mask to a depth image of arbitrary dtype."""
     import cv2
+    if (mask.shape[1], mask.shape[0]) != (depth_image.shape[1], depth_image.shape[0]):
+        mask = cv2.resize(mask, (depth_image.shape[1], depth_image.shape[0]), interpolation=cv2.INTER_NEAREST)
     if depth_image.dtype == np.uint16:
         return cv2.bitwise_and(depth_image, depth_image, mask=mask)
     # float32 — cv2.bitwise_and doesn't support float; use numpy masking instead

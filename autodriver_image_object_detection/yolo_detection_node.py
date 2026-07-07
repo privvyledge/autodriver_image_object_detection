@@ -912,6 +912,8 @@ class ImageObstacleDetectionNode(Node):
                         if self.msg_metadata['rgb'].get('inverse_conversion') is not None:
                             cv_image_inverted = cv2.cvtColor(self.images['rgb'],
                                                              self.msg_metadata['rgb'].get('inverse_conversion'))
+                        if (mask_img.shape[1], mask_img.shape[0]) != (cv_image_inverted.shape[1], cv_image_inverted.shape[0]):
+                            mask_img = cv2.resize(mask_img, (cv_image_inverted.shape[1], cv_image_inverted.shape[0]), interpolation=cv2.INTER_NEAREST)
                         color_mask_img = cv2.bitwise_and(cv_image_inverted, cv_image_inverted, mask=mask_img)
                         if self.show_image:
                             try:
@@ -1459,6 +1461,9 @@ class ImageObstacleDetectionNode(Node):
             # mask_ = np.zeros(depth_image.shape[:2], dtype=np.uint8)
             # cv2.fillPoly(mask_, [np.array(mask_array, dtype=np.int32)], 255)
             # roi = cv2.bitwise_and(depth_image, depth_image, mask=mask_)  # same as below
+
+            if (mask_data.shape[1], mask_data.shape[0]) != (depth_image.shape[1], depth_image.shape[0]):
+                mask_data = cv2.resize(mask_data, (depth_image.shape[1], depth_image.shape[0]), interpolation=cv2.INTER_NEAREST)
 
             roi = cv2.bitwise_and(depth_image, depth_image, mask=mask_data)  # same as above
 
