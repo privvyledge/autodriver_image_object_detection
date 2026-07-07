@@ -264,6 +264,9 @@ class ImageObstacleDetectionNode(Node):
         self.declare_parameter('static_camera_to_robot_tf', True)
         self.declare_parameter('depth_scale', 1.0)  # mm to meters. 1.0 for Carla (32FC1), 1000.0 for Realsense (16UC1)
         self.declare_parameter('depth_max', 50.0)  # meters. 1000. for Carla, 6.0 for Realsense
+        # upper bound on the 3D box extent along the camera view axis (meters);
+        # rejects background depth pixels bleeding through the mask edges
+        self.declare_parameter('depth_box_thickness', 4.0)
         self.declare_parameter(name='normalize_depth', value=False, descriptor=ParameterDescriptor(
                 description='',
                 type=ParameterType.PARAMETER_BOOL))
@@ -339,6 +342,8 @@ class ImageObstacleDetectionNode(Node):
         self.static_camera_info = self.get_parameter("static_camera_info").get_parameter_value().bool_value
         self.depth_scale = self.get_parameter("depth_scale").get_parameter_value().double_value
         self.depth_max = self.get_parameter("depth_max").get_parameter_value().double_value
+        self.depth_box_thickness = self.get_parameter(
+            "depth_box_thickness").get_parameter_value().double_value
         self.normalize_depth = self.get_parameter("normalize_depth").get_parameter_value().bool_value
         self.normalized_max = self.get_parameter("normalized_max").get_parameter_value().double_value
 
@@ -509,8 +514,13 @@ class ImageObstacleDetectionNode(Node):
                 self.camera_infos['depth'] = None
                 self.camera_models['depth'] = PinholeCameraModel()
                 depth_dict = {'depth': None, 'rgbd': None}
-                self.output_frame_to_rgb_tf = None
-                self.output_frame_to_rgb_tf_torch = None
+                # depth->rgb (for depth/RGB alignment) and depth->output_frame (for
+                # lifting optical-frame boxes) caches. Kept separate from the
+                # pointcloud path's output_frame_to_rgb_tf* cache — sharing one
+                # variable let whichever path ran first poison the other.
+                self.depth_to_rgb_tf = None
+                self.depth_to_rgb_tf_torch = None
+                self.depth_to_output_tf = None
                 self.images.update(depth_dict)
                 self.frame_ids.update(depth_dict)
                 self.headers.update(depth_dict)
@@ -609,9 +619,12 @@ class ImageObstacleDetectionNode(Node):
                     f'Could not cast .pt model to fp16 ({e}); falling back to fp32 inference.')
                 self.inference_dict['half'] = False
 
-        # Initialize TF buffer and listener
+        # Initialize TF buffer and listener. spin_thread=True so /tf keeps flowing
+        # while a blocking lookup_transform waits inside the detection callback;
+        # otherwise the single-threaded executor starves the TF subscription and
+        # every lookup stalls for the full transform_timeout.
         self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.tf_listener = TransformListener(self.tf_buffer, self, spin_thread=True)
 
         # optionally append /compressed to detection and segmentation topics if not in the strings
         if self.input_image_topic_is_compressed:
@@ -1091,10 +1104,17 @@ class ImageObstacleDetectionNode(Node):
                 if depth_timestamp is None:
                     depth_timestamp = self.get_clock().now().to_msg()
 
-                self.get_camera_to_robot_tf(
-                        self.frame_ids['depth'],
-                        None if self.static_camera_to_robot_tf else depth_timestamp,  # depth_timestamp
-                )
+                # Cache the depth-camera -> output_frame transform used to lift
+                # optical-frame boxes into the output frame. Deliberately not
+                # camera_to_robot_tf: the pointcloud branch caches the lidar frame
+                # there and static caching would keep whichever was set first.
+                if self.output_frame and (
+                        self.depth_to_output_tf is None or not self.static_camera_to_robot_tf):
+                    _tf = self.lookup_transform(
+                            self.frame_ids['depth'], self.output_frame,
+                            None if self.static_camera_to_robot_tf else depth_timestamp)
+                    if _tf is not None:
+                        self.depth_to_output_tf = self.transform_to_matrix(_tf)
                 detection3d_depth_array = Detection3DArray()
                 detection3d_depth_array.header.frame_id = self.output_frame if self.output_frame else self.frame_ids['depth']
                 detection3d_depth_array.header.stamp = depth_timestamp
@@ -1238,27 +1258,37 @@ class ImageObstacleDetectionNode(Node):
                     if self.use_depth and (self.images['depth'] is not None):
                         with self.profiler.measure("depth_projection"):
                             x, y, z, size_x, size_y, size_z, quat, points_3d = self.project_to_3d_with_depth(
-                                mask, bbox, self.images['depth'])
+                                mask, bbox, self.images['depth'], infer_shape=result.orig_shape)
 
                         if x is not None:
-                            # transform the boxes to the robot frame
+                            # transform the boxes from the camera optical frame
+                            # (x-right, y-down, z-forward) to the robot frame
                             frame_id = self.frame_ids["depth"]
+                            depth_box_valid = True
                             if self.output_frame:
                                 frame_id = self.output_frame
-                                # if self.camera_to_robot_tf is not None:
-                                #     x, y, z, size_x, size_y, size_z, points_3d = self.transform_bbox_3d(
-                                #         x, y, z, size_x, size_y, size_z, points_3d)
+                                if self.depth_to_output_tf is not None:
+                                    x, y, z, size_x, size_y, size_z = self.transform_box_to_frame(
+                                        x, y, z, size_x, size_y, size_z, self.depth_to_output_tf)
+                                else:
+                                    # publishing optical coords stamped as output_frame
+                                    # would place boxes above/behind the robot
+                                    depth_box_valid = False
+                                    self.get_logger().warn(
+                                        f"No TF {self.frame_ids['depth']} -> {self.output_frame} yet; "
+                                        f"skipping depth 3D detection.", throttle_duration_sec=5.0)
 
                             # Append 3D detection (x, y, z, size_x, size_y, size_z, confidence, class_id)
                             # frame_id: output_frame (base_link) when set, else depth sensor frame
-                            detection3d_depth_array.detections.append(
-                                self.create_3d_detection(x, y, z, size_x, size_y, size_z, conf,
-                                                         result.names.get(int(cls)), frame_id=frame_id))
-                            marker_depth_array.markers.append(
-                                self.create_marker(
-                                    i, x, y, z, size_x, size_y, size_z, frame_id,
-                                    depth_timestamp, conf, result.names.get(int(cls)), track_id=None,
-                                    rgba=[1.0, 0.0, 0.0, 0.5]))
+                            if depth_box_valid:
+                                detection3d_depth_array.detections.append(
+                                    self.create_3d_detection(x, y, z, size_x, size_y, size_z, conf,
+                                                             result.names.get(int(cls)), frame_id=frame_id))
+                                marker_depth_array.markers.append(
+                                    self.create_marker(
+                                        i, x, y, z, size_x, size_y, size_z, frame_id,
+                                        depth_timestamp, conf, result.names.get(int(cls)), track_id=None,
+                                        rgba=[1.0, 0.0, 0.0, 0.5]))
 
                     if self.use_pointcloud and (self.images['pointcloud'] is not None):
                         with self.profiler.measure("pointcloud_projection"):
@@ -1398,7 +1428,7 @@ class ImageObstacleDetectionNode(Node):
 
         return aligned_depth * depth_scale
 
-    def project_to_3d_with_depth(self, mask, xywh, depth_image):
+    def project_to_3d_with_depth(self, mask, xywh, depth_image, infer_shape=None):
         # todo: refactor as this is wrong and does not work, e.g with carla
         """
         Steps:
@@ -1414,8 +1444,15 @@ class ImageObstacleDetectionNode(Node):
         :param depth_image:
         :return:
         """
-        bbox_center_x, bbox_center_y = map(int, xywh[:2])
-        bbox_size_x, bbox_size_y = map(int, xywh[2:])
+        # Ultralytics boxes live in the source-image pixel space (result.orig_shape,
+        # e.g. 640x640 when resize_image shrank the frame before inference); rescale
+        # to the depth image pixel space before indexing it or unprojecting with
+        # intrinsics.
+        ref_h, ref_w = infer_shape[:2] if infer_shape else depth_image.shape[:2]
+        u_scale = depth_image.shape[1] / float(ref_w)
+        v_scale = depth_image.shape[0] / float(ref_h)
+        bbox_center_x, bbox_center_y = int(xywh[0] * u_scale), int(xywh[1] * v_scale)
+        bbox_size_x, bbox_size_y = int(xywh[2] * u_scale), int(xywh[3] * v_scale)
 
         # Step 1: Project the depth image to the RGB frame.
         dtype = torch.float32
@@ -1430,23 +1467,23 @@ class ImageObstacleDetectionNode(Node):
         k_depth = self.camera_models["depth"].K  # self.camera_infos['depth'].k.reshape(3,3)
 
         # transform points to RGB
-        if self.output_frame_to_rgb_tf is None or not self.static_camera_to_robot_tf:
+        if self.depth_to_rgb_tf is None or not self.static_camera_to_robot_tf:
             source_frame = self.frame_ids['depth']
 
             transform = self.lookup_transform(source_frame, self.frame_ids['rgb'], rclpy.time.Time())
 
             if transform is not None:
-                self.output_frame_to_rgb_tf = self.transform_to_matrix(transform)  # output_frame_to_rgb_tf
-                self.output_frame_to_rgb_tf_torch = torch.as_tensor(self.output_frame_to_rgb_tf, dtype=dtype, device=self.torch_device)
+                self.depth_to_rgb_tf = self.transform_to_matrix(transform)
+                self.depth_to_rgb_tf_torch = torch.as_tensor(self.depth_to_rgb_tf, dtype=dtype, device=self.torch_device)
 
-        if (self.output_frame_to_rgb_tf_torch is not None) and not torch.equal(
-                self.output_frame_to_rgb_tf_torch,
-                torch.eye(self.output_frame_to_rgb_tf_torch.shape[0], dtype=dtype, device=self.torch_device)):
+        if (self.depth_to_rgb_tf_torch is not None) and not torch.equal(
+                self.depth_to_rgb_tf_torch,
+                torch.eye(self.depth_to_rgb_tf_torch.shape[0], dtype=dtype, device=self.torch_device)):
             depth_image = self.align_depth_to_rgb(
                     torch.from_numpy(depth_image).to(dtype=dtype, device=self.torch_device),
                     torch.from_numpy(k_depth).to(dtype=dtype, device=self.torch_device),
                     torch.from_numpy(k_rgb).to(dtype=dtype, device=self.torch_device),
-                    self.output_frame_to_rgb_tf_torch, (H_rgb, W_rgb), self.depth_scale)
+                    self.depth_to_rgb_tf_torch, (H_rgb, W_rgb), self.depth_scale)
             depth_image = depth_image.cpu().numpy()
 
         # Step 2: Get the ROI of the mask (or bbox) in the depth image
@@ -1501,33 +1538,38 @@ class ImageObstacleDetectionNode(Node):
         if not np.any(roi):
             return None, None, None, None, None, None, None, None
 
-        # filter out z-values above the depth max
-        rows, cols = np.where(roi > 0)
+        # keep valid pixels within the sensor's usable range (depth_max drops
+        # e.g. CARLA sky pixels at ~1000 m)
+        valid = np.isfinite(roi) & (roi > 0) & (roi <= self.depth_max)
+        rows, cols = np.where(valid)
         depths = roi[rows, cols]
 
         # find the z coordinate on the 3D BB
         if mask is not None:
-            # Step 4: filter out invalid depth pixels, i.e roi[roi > 0]
-            roi = roi[roi > 0]
-
-            # Step 5: Find the z coordinate (distance) of the mask, np.median(roi) or bounding_box_center/depth_scale
+            # Step 4/5: median depth of the mask is the object distance
+            roi = depths
+            if roi.size == 0:
+                return None, None, None, None, None, None, None, None
             bb_center_z_coord = np.median(roi)
-            ''' Method 2: z1 = np.median(valid_depths)  # Approximate depth. np.median(mask_depth_values)'''
-
         else:
+            roi = depths
+            if roi.size == 0:
+                return None, None, None, None, None, None, None, None
             bb_center_z_coord = (
                     depth_image[bbox_center_y][bbox_center_x] / self.depth_scale
             )
 
-        # Step 6: (optional) crop values outside of depth_max
+        # Step 6: keep only depths within the box-thickness window around the
+        # object distance — mask bleed otherwise pulls background pixels in and
+        # inflates the box to tens of meters along the view axis
         z_diff = np.abs(roi - bb_center_z_coord)
-        mask_z = z_diff <= self.depth_max
+        mask_z = z_diff <= (self.depth_box_thickness / 2.0)
         if not np.any(mask_z):
             return None, None, None, None, None, None, None, None
 
         roi = roi[mask_z]
         z_min, z_max = np.min(roi), np.max(roi)
-        z = (z_max + z_min) / 2
+        z = float(bb_center_z_coord)
 
         if z == 0:
             return None, None, None, None, None, None, None, None
@@ -1578,7 +1620,7 @@ class ImageObstacleDetectionNode(Node):
         # Step 1: Apply the extrinsics to the camera frame from the current frame, i.e apply camera -> self.output_frame extrinsics
         points_ = points.clone()
 
-        if self.output_frame_to_rgb_tf is None or not self.static_camera_to_robot_tf:
+        if self.output_frame_to_rgb_tf_o3d is None or not self.static_camera_to_robot_tf:
             # source_frame = self.output_frame or self.frame_ids['pointcloud']
             source_frame = self.frame_ids['pointcloud']
             if self.output_frame and self.pointcloud_preprocessor.transform_pointcloud:
@@ -1606,11 +1648,13 @@ class ImageObstacleDetectionNode(Node):
         x_2d = (x_ * fx / z_) + cx
         y_2d = (y_ * fy / z_) + cy
 
-        # Step 3: remove points outside the fov of the RGB camera
-        image_width = mask_data.shape[1]
-        image_height = mask_data.shape[0]
-        valid_points_mask = (x_2d >= 0) & (x_2d < image_width) & \
-                       (y_2d >= 0) & (y_2d < image_height)  # Find points that project into the mask image
+        # Step 3: remove points behind the camera and outside the RGB camera fov.
+        # Bounds use the camera image size (the intrinsics' pixel space), NOT the
+        # mask size — the mask is in the inference-image space (e.g. 640x640).
+        image_width = self.camera_models['rgb'].width
+        image_height = self.camera_models['rgb'].height
+        valid_points_mask = (z_ > 0) & (x_2d >= 0) & (x_2d < image_width) & \
+                       (y_2d >= 0) & (y_2d < image_height)  # Find points that project into the image
 
         # Filter valid projected points
         # valid_projected_points = self.o3d_pointcloud.point.positions[valid_points_mask]
@@ -1619,8 +1663,11 @@ class ImageObstacleDetectionNode(Node):
         if valid_projected_points.is_empty():
             return None, None, None, None, None, None, None, None
 
-        valid_x_2d = x_2d[valid_points_mask].to(o3c.Dtype.Int64)
-        valid_y_2d = y_2d[valid_points_mask].to(o3c.Dtype.Int64)
+        # scale camera-space pixel coords into the mask's (inference-image) space
+        # before indexing, otherwise the lookup is misaligned and offset
+        mask_height, mask_width = mask_data.shape[0], mask_data.shape[1]
+        valid_x_2d = (x_2d[valid_points_mask] * (mask_width / image_width)).to(o3c.Dtype.Int64)
+        valid_y_2d = (y_2d[valid_points_mask] * (mask_height / image_height)).to(o3c.Dtype.Int64)
 
         # Get mask values for these points. todo: could also use RGB image
         mask_values = mask_data[valid_y_2d, valid_x_2d]
@@ -1853,6 +1900,15 @@ class ImageObstacleDetectionNode(Node):
         # self.camera_to_robot_tf = tf_matrix
         return matrix
 
+    @staticmethod
+    def transform_box_to_frame(x, y, z, size_x, size_y, size_z, tf_matrix):
+        """Transform an axis-aligned box with a 4x4 matrix: the center gets the full
+        transform, the size only the rotation (|R|, no translation)."""
+        center = tf_matrix @ np.array([x, y, z, 1.0])
+        size = np.abs(tf_matrix[:3, :3]) @ np.array([size_x, size_y, size_z])
+        return (float(center[0]), float(center[1]), float(center[2]),
+                float(size[0]), float(size[1]), float(size[2]))
+
     def transform_bbox_3d(self, x, y, z, size_x, size_y, size_z, points_3d):
         # transform the pose
         object_pose_camera_frame = np.array([x, y, z, 1])
@@ -2080,6 +2136,8 @@ class ImageObstacleDetectionNode(Node):
                 self.static_camera_info = param.value
             elif param.name == 'publish_empty_detections' and param.type_ == Parameter.Type.BOOL:
                 self.publish_empty_detections = param.value
+            elif param.name == 'depth_box_thickness' and param.type_ == Parameter.Type.DOUBLE:
+                self.depth_box_thickness = param.value
             elif apply_profiler_param(self.profiler, param.name, param.value):
                 pass
             else:

@@ -125,7 +125,7 @@ Run the detector node with pointclouds disabled. The time synchronizer will only
 
 ```bash
 ros2 run autodriver_image_object_detection yolo_detector --ros-args \
-  -p model_path:=/home/digitalstorm/bolus_ws/Repositories/autonomous_driving_simulators/data/models/yolo11x-seg.engine \
+  -p model_path:=/home/carla/data/models/yolo11x-seg.engine \
   -p use_image_dimensions:=false \
   -p resize_image:=true \
   -p use_depth:=true \
@@ -145,7 +145,7 @@ ros2 topic hz /yolo/detection_results
 
 # Verify 3D detections lifted via depth are publishing
 ros2 topic hz /yolo/detection3d_depth_results
-ros2 topic echo /yolo/detection3d_depth_results --once
+ros2 topic echo --flow-style /yolo/detection3d_depth_results --once
 ```
 * **RViz2 Visualization:** Set Fixed Frame to `ego_vehicle`. Add `/yolo/detection_image` (Annotated Image) and `/yolo/markers_depth` (Depth Markers).
 
@@ -161,7 +161,7 @@ export LD_PRELOAD=${HOME}/sdks/open3d_install/lib/libOpen3D.so
 
 # Run node with pointclouds enabled
 ros2 run autodriver_image_object_detection yolo_detector --ros-args \
-  -p model_path:=/home/digitalstorm/bolus_ws/Repositories/autonomous_driving_simulators/data/models/yolo11x-seg.engine \
+  -p model_path:=/home/carla/data/models/yolo11x-seg.engine \
   -p use_image_dimensions:=false \
   -p resize_image:=true \
   -p use_depth:=true \
@@ -178,7 +178,7 @@ ros2 run autodriver_image_object_detection yolo_detector --ros-args \
 ```bash
 # Verify 3D detections from pointclouds are publishing
 ros2 topic hz /yolo/detection3d_pointcloud_results
-ros2 topic echo /yolo/detection3d_pointcloud_results --once
+ros2 topic echo --flow-style /yolo/detection3d_pointcloud_results --once
 ```
 * **RViz2 Visualization:** Add markers from `/yolo/markers_pointcloud`.
 * *Note:* If results are empty, check `ros2 topic hz /carla/ego_vehicle/lidar` and consider loosening `synchronization_interval` if messages are out-of-sync.
@@ -221,10 +221,12 @@ ros2 run autodriver_image_object_detection single_stream_detector --ros-args \
   ```
 
 ### Bounding Box Extent
-* **`depth_box_thickness` (Double, default `4.0`):** Upper limit on the 3D bounding box thickness along the view-axis. Used to prevent background noise from expanding the box dimension. Run the following command at runtime to tweak:
+* **`depth_box_thickness` (Double, default `4.0`):** Upper limit on the 3D bounding box thickness along the view-axis. Used to prevent background noise from expanding the box dimension. Supported by both `depth_fusion_node` and `yolo_detector` (`image_obstacle_detection_node`). Run the following command at runtime to tweak:
   ```bash
   ros2 param set /depth_fusion_node depth_box_thickness 4.0
+  ros2 param set /image_obstacle_detection_node depth_box_thickness 4.0
   ```
+* In `yolo_detector`, `depth_max` is now strictly the maximum usable depth range (drops e.g. CARLA sky pixels at ~1000 m); the box thickness is governed by `depth_box_thickness`, and the box center uses the median mask depth.
 
 ### Heartbeat / Empty Costmap Clearing
 * **`publish_empty_detections` (Bool, default `true`):** When no objects are detected, the node publishes an empty `Detection3DArray` and a `DELETEALL` marker to clear downstream costmaps and remove old RViz markers.
