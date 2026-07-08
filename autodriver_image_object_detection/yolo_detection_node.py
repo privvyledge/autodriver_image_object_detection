@@ -287,6 +287,9 @@ class ImageObstacleDetectionNode(Node):
         self.declare_parameter('cluster_min_height', 0.1)  # min height of cluster
         self.declare_parameter('cluster_max_height', 2.0)  # max height of cluster
         self.declare_parameter("bounding_box_type", "AABB")  # AABB or OBB
+        # which DBSCAN cluster of the masked lidar points represents the object:
+        # 'largest' (most points), 'closest' (nearest centroid), 'first' (label order)
+        self.declare_parameter("cluster_selection", "largest")
         self.declare_parameter('publish_object_array', True)
         self.declare_parameter('publish_obstacle_array', True)
 
@@ -361,6 +364,8 @@ class ImageObstacleDetectionNode(Node):
         self.cluster_min_height = self.get_parameter('cluster_min_height').value
         self.cluster_max_height = self.get_parameter('cluster_max_height').value
         self.bounding_box_type = self.get_parameter("bounding_box_type").value
+        self.cluster_selection = self.get_parameter(
+            "cluster_selection").get_parameter_value().string_value.lower()
 
         os.environ['YOLO_VERBOSE'] = str(self.verbose)
 
@@ -487,11 +492,28 @@ class ImageObstacleDetectionNode(Node):
                 self.classes = [desired_class for desired_class in self.classes if desired_class or desired_class == 0]
                 # if classes is a list of strings
                 if isinstance(self.classes[0], str):
-                    assert all(x in self.supported_class_names for x in self.classes)
-                    self.classes = [self.class_names_inv[x.strip()] for x in self.classes]
+                    requested = [x.strip() for x in self.classes]
+                    unknown = [x for x in requested if x not in self.supported_class_names]
+                    if unknown:
+                        self.get_logger().error(
+                            f"Ignoring unsupported class name(s) {unknown}. The loaded model "
+                            f"supports: {sorted(self.supported_class_names)}")
+                    self.classes = [self.class_names_inv[x] for x in requested
+                                    if x in self.supported_class_names]
+                    if not self.classes:
+                        raise ValueError(
+                            f"None of the requested classes {requested} are supported by the model.")
                 # if classes is a list of ints
                 elif isinstance(self.classes[0], int):
-                    assert all(x in self.supported_class_keys for x in self.classes)
+                    unknown = [x for x in self.classes if x not in self.supported_class_keys]
+                    if unknown:
+                        self.get_logger().error(
+                            f"Ignoring unsupported class id(s) {unknown}. Valid ids: "
+                            f"0..{num_model_classes - 1}")
+                    self.classes = [x for x in self.classes if x in self.supported_class_keys]
+                    if not self.classes:
+                        raise ValueError(
+                            "None of the requested class ids are supported by the model.")
                 else:
                     raise ValueError("Classes must either be a list of ints or a strings.")
             else:
@@ -1678,14 +1700,25 @@ class ImageObstacleDetectionNode(Node):
 
         # Step 4: cluster points and get the bounding box. todo: move this outside of the loop to perform once
         clusters, bboxes, centers, extents, quats = self.cluster_points(masked_points)
-        # only select the cluster with the largest label
-        # get the center (if not using the bbox)
-        # centroid = np.mean(clustered_points, axis=0)
         if bboxes:
-            x, y, z = centers[0]
-            size_x, size_y, size_z = extents[0]
-            return x, y, z, size_x, size_y, size_z, quats[0], clusters
+            idx = self.select_cluster(clusters, centers)
+            x, y, z = centers[idx]
+            size_x, size_y, size_z = extents[idx]
+            return x, y, z, size_x, size_y, size_z, quats[idx], clusters
         return None, None, None, None, None, None, None, None
+
+    def select_cluster(self, clusters, centers):
+        """Pick which DBSCAN cluster of the masked points represents the detected
+        object, per the cluster_selection param: 'largest' keeps the cluster with
+        the most points (mask-bleed clusters are small), 'closest' keeps the
+        nearest centroid (the object is the front surface of the frustum),
+        'first' keeps DBSCAN label order (legacy behavior, arbitrary)."""
+        if len(clusters) == 1 or self.cluster_selection == 'first':
+            return 0
+        if self.cluster_selection == 'closest':
+            return int(np.argmin([np.linalg.norm(c) for c in centers]))
+        # 'largest'
+        return int(np.argmax([c.point.positions.shape[0] for c in clusters]))
 
     def cluster_points(self, o3d_pcd):
         """
@@ -2081,12 +2114,23 @@ class ImageObstacleDetectionNode(Node):
             elif param.name == 'classes' and param.type_ in (Parameter.Type.STRING_ARRAY, Parameter.Type.INTEGER_ARRAY):
                 classes = param.value
                 if param.type_ == Parameter.Type.STRING_ARRAY:
-                    assert all(x in self.supported_class_names for x in classes)
-                    self.classes = [self.class_names_inv[x.strip()] for x in classes]
+                    requested = [x.strip() for x in classes]
+                    unknown = [x for x in requested if x not in self.supported_class_names]
+                    valid = [self.class_names_inv[x] for x in requested
+                             if x in self.supported_class_names]
                 else:
-                    assert all(x in self.supported_class_keys for x in classes)
-                    self.classes = classes
-                self.inference_dict['classes'] = self.classes
+                    unknown = [x for x in classes if x not in self.supported_class_keys]
+                    valid = [x for x in classes if x in self.supported_class_keys]
+                if unknown:
+                    self.get_logger().error(
+                        f"Ignoring unsupported class(es) {unknown}. The loaded model "
+                        f"supports: {sorted(self.supported_class_names)}")
+                if valid:
+                    self.classes = valid
+                    self.inference_dict['classes'] = self.classes
+                else:
+                    result.successful = False
+                    result.reason = "No supported classes in the requested list; keeping previous."
             elif param.name == 'update_class' and param.type_ == Parameter.Type.STRING:
                 # Update the list of classes based on the update_class parameter.
                 # For CLI, add -- before -class,
@@ -2138,6 +2182,12 @@ class ImageObstacleDetectionNode(Node):
                 self.publish_empty_detections = param.value
             elif param.name == 'depth_box_thickness' and param.type_ == Parameter.Type.DOUBLE:
                 self.depth_box_thickness = param.value
+            elif param.name == 'cluster_selection' and param.type_ == Parameter.Type.STRING:
+                if param.value.lower() in ('largest', 'closest', 'first'):
+                    self.cluster_selection = param.value.lower()
+                else:
+                    result.successful = False
+                    result.reason = "cluster_selection must be 'largest', 'closest', or 'first'."
             elif apply_profiler_param(self.profiler, param.name, param.value):
                 pass
             else:

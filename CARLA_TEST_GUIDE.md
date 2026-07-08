@@ -189,9 +189,12 @@ ros2 topic echo --flow-style /yolo/detection3d_pointcloud_results --once
 
 The following behaviors changed in recent commits and should be specifically re-checked, not just assumed working:
 
-- [ ] **Lidar-mount centroid offset fixed** — with RGB+pointcloud running, cluster centroids on `/depth_fusion/detection3d_pointcloud` should land on the object in `ego_vehicle`/`map`, not offset by the lidar mount position.
-- [ ] **`yolo_detector` pointcloud path no longer crashes** — running with `-p use_pointcloud:=true` should start and run normally, not crash at (the previously reported) line 536.
-- [ ] **`.pt` model at half precision no longer errors** — `single_stream_detector -p model_path:=.../yolo11x-seg.pt` (no `export_and_exit`) should run without a `Half != float` dtype error.
+- [ ] **Lidar-mount centroid offset fixed** — with RGB+pointcloud running, cluster centroids on `/depth_fusion/detection3d_pointcloud` should land on the object in `ego_vehicle`/`map`, not offset by the lidar mount position. *(depth_fusion_node itself not yet re-run in CARLA; the equivalent yolo_detector path passed 2026-07-07.)*
+- [x] **`yolo_detector` pointcloud path no longer crashes** — verified 2026-07-07 in CARLA; runs at ~4.6 Hz with `-p use_pointcloud:=true`.
+- [ ] **`.pt` model at half precision no longer errors** — `single_stream_detector -p model_path:=.../yolo11x-seg.pt` (no `export_and_exit`) should run without a `Half != float` dtype error. *(yolo_detector with the .pt model ran clean 2026-07-07; single_stream_detector variant still to be re-run.)*
+- [x] **Phase 1 depth→3D positions correct** — verified 2026-07-07: car straight ahead reported at `(15.2, 0.10, 0.78)` in `ego_vehicle` with size `(2.1, 1.9, 1.4)` (was previously above/behind ego with ~35 m height).
+- [x] **Phase 2 pointcloud→3D non-empty with `use_depth` AND `use_pointcloud` both true** — verified 2026-07-07: `(15.9, 0.09, 0.76)`, size `(1.7, 1.7, 1.2)`, agreeing with the depth estimate; previously silently empty.
+- [x] **TF warm-up no longer stalls the pipeline** — verified 2026-07-07: no repeated "frame does not exist" spam; full rate within ~1 s of startup.
 
 ```bash
 ros2 topic echo /depth_fusion/detection3d_depth --once
@@ -227,6 +230,15 @@ ros2 run autodriver_image_object_detection single_stream_detector --ros-args \
   ros2 param set /image_obstacle_detection_node depth_box_thickness 4.0
   ```
 * In `yolo_detector`, `depth_max` is now strictly the maximum usable depth range (drops e.g. CARLA sky pixels at ~1000 m); the box thickness is governed by `depth_box_thickness`, and the box center uses the median mask depth.
+
+### Cluster Selection (yolo_detector pointcloud path)
+* **`cluster_selection` (String, default `largest`):** Which DBSCAN cluster of the mask-frustum lidar points becomes the 3D box: `largest` (most points — mask-bleed clusters are small), `closest` (nearest centroid — conservative for obstacle avoidance), `first` (legacy label-order behavior). Dynamically reconfigurable:
+  ```bash
+  ros2 param set /image_obstacle_detection_node cluster_selection closest
+  ```
+
+### Class Filtering
+* Unsupported names in `classes` are now **dropped with an error log** listing the supported names, instead of an opaque `AssertionError` crash. The node only aborts if *no* requested class is valid. Note: COCO has no `firetruck` class — fire trucks are detected as `truck`.
 
 ### Heartbeat / Empty Costmap Clearing
 * **`publish_empty_detections` (Bool, default `true`):** When no objects are detected, the node publishes an empty `Detection3DArray` and a `DELETEALL` marker to clear downstream costmaps and remove old RViz markers.
