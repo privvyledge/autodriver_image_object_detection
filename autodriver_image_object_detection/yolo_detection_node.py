@@ -292,11 +292,19 @@ class ImageObstacleDetectionNode(Node):
         self.declare_parameter("cluster_selection", "largest")
         self.declare_parameter('publish_object_array', True)
         self.declare_parameter('publish_obstacle_array', True)
+        # ObjectArray/ObstacleArray carry metric 3D objects, so they need a projection
+        # source when both depth and pointcloud are enabled: 'depth' or 'pointcloud'.
+        self.declare_parameter('object_array_source', 'depth')
 
         # Get parameters
         self.use_sim_time = self.get_parameter('use_sim_time').get_parameter_value().bool_value
         self.publish_object_array = self.get_parameter('publish_object_array').get_parameter_value().bool_value
         self.publish_obstacle_array = self.get_parameter('publish_obstacle_array').get_parameter_value().bool_value
+        self.object_array_source = self.get_parameter('object_array_source').value
+        if self.object_array_source not in ('depth', 'pointcloud'):
+            raise ValueError(
+                f"object_array_source must be 'depth' or 'pointcloud', "
+                f"got '{self.object_array_source}'.")
         self.input_image_topic = self.get_parameter('input_image_topic').value
         self.input_camera_info_topic = self.get_parameter('input_camera_info_topic').value
         self.input_image_topic_is_compressed = self.get_parameter('input_image_topic_is_compressed').value
@@ -1097,20 +1105,61 @@ class ImageObstacleDetectionNode(Node):
             return detections_msg, self.detection_image, mask_img
         return None, None, None
 
+    def _publish_object_arrays(self, objects_msg, obstacle_msg):
+        """Publish the metric object arrays.
+
+        An empty array is a heartbeat telling downstream costmaps that nothing is
+        there any more; without it a consumer keeps the last obstacles forever.
+        Emitted only when publish_empty_detections is set, matching the 3D arrays.
+        """
+        if objects_msg is not None and hasattr(self, 'object_array_pub'):
+            if objects_msg.objects or self.publish_empty_detections:
+                self.object_array_pub.publish(objects_msg)
+        if obstacle_msg is not None and hasattr(self, 'obstacle_detection_pub'):
+            if obstacle_msg.obstacles or self.publish_empty_detections:
+                self.obstacle_detection_pub.publish(obstacle_msg)
+
+    def pack_metric_object(self, objects_msg, obstacle_msg, x, y, z, size_x, size_y, size_z,
+                           class_name, conf, track_id, quat=None):
+        """Append one projected 3D object (metres, in the arrays' header frame)."""
+        id_ = track_id if track_id is not None else -1
+        if objects_msg is not None:
+            objects_msg.objects.append(
+                pack_derived_object_msg(x, y, size_x, size_y, class_name, conf, id=id_,
+                                        z=z, z_size=size_z, quat=quat,
+                                        tracked=track_id is not None))
+        if obstacle_msg is not None:
+            obstacle_msg.obstacles.append(
+                pack_nav2_obstacle_msg(x, y, size_x, size_y, class_name, conf, id=id_,
+                                       z=z, z_size=size_z))
+
     def create_detections_array(self, results, header):
         # Create 2D result messages
         detections_msg = Detection2DArray()
         detections_msg.header.stamp = self.msg_metadata['rgb'].get('msg_timestamp')  # self.get_clock().now().to_msg()
         detections_msg.header.frame_id = self.frame_ids['rgb']
 
-        objects_msg = ObjectArray()
-        objects_msg.header.stamp = self.msg_metadata['rgb'].get('msg_timestamp')   # self.get_clock().now().to_msg()
-        objects_msg.header.frame_id = self.frame_ids['rgb']
+        # ObjectArray/ObstacleArray are metric 3D outputs: they are only populated
+        # from the configured projection source, and only when that source is active.
+        # Pixel-space results are published on Detection2DArray instead.
+        source_active = self.project_to_3d and (
+            (self.object_array_source == 'depth' and self.use_depth)
+            or (self.object_array_source == 'pointcloud' and self.use_pointcloud))
+        # frame_ids[source] is only populated once that sensor's first message lands.
+        object_frame = self.output_frame or self.frame_ids.get(self.object_array_source)
+        source_active = source_active and object_frame is not None
 
-        if self.publish_obstacle_array and NAV2_DYNAMIC_MSGS_AVAILABLE:
+        if self.publish_object_array and source_active:
+            objects_msg = ObjectArray()
+            objects_msg.header.stamp = self.msg_metadata['rgb'].get('msg_timestamp')
+            objects_msg.header.frame_id = object_frame
+        else:
+            objects_msg = None
+
+        if self.publish_obstacle_array and NAV2_DYNAMIC_MSGS_AVAILABLE and source_active:
             obstacle_msg = ObstacleArray()
-            obstacle_msg.header.stamp = self.msg_metadata['rgb'].get('msg_timestamp')  # self.get_clock().now().to_msg()
-            obstacle_msg.header.frame_id = self.frame_ids['rgb']
+            obstacle_msg.header.stamp = self.msg_metadata['rgb'].get('msg_timestamp')
+            obstacle_msg.header.frame_id = object_frame
         else:
             obstacle_msg = None
 
@@ -1199,6 +1248,7 @@ class ImageObstacleDetectionNode(Node):
                     if self.use_pointcloud:
                         self.detection3d_pointcloud_results_pub.publish(detection3d_pointcloud_array)
                         self.marker_pointcloud_pub.publish(make_deleteall_marker_array())
+                self._publish_object_arrays(objects_msg, obstacle_msg)
                 return detections_msg, mask_img
 
             track_ids = None
@@ -1264,17 +1314,6 @@ class ImageObstacleDetectionNode(Node):
                         id=track_ids[i] if track_ids is not None else -1)
                 detections_msg.detections.append(detection_2d)
 
-                # pack object message
-                object_2d = pack_derived_object_msg(bbox[0], bbox[1], bbox[2], bbox[3], result.names.get(int(cls)),
-                                                    conf,
-                                                    id=track_ids[i] if track_ids is not None else -1)
-                objects_msg.objects.append(object_2d)
-
-                if obstacle_msg is not None:
-                    obstacle_2d = pack_nav2_obstacle_msg(
-                        bbox[0], bbox[1], bbox[2], bbox[3], result.names.get(int(cls)), conf, id=track_ids[i] if track_ids is not None else -1, z_size=0.0)  # todo: replace with height
-                    obstacle_msg.obstacles.append(obstacle_2d)
-
                 if self.project_to_3d:
                     # could run depth and pointcloud processing in different threads
                     if self.use_depth and (self.images['depth'] is not None):
@@ -1311,6 +1350,11 @@ class ImageObstacleDetectionNode(Node):
                                         i, x, y, z, size_x, size_y, size_z, frame_id,
                                         depth_timestamp, conf, result.names.get(int(cls)), track_id=None,
                                         rgba=[1.0, 0.0, 0.0, 0.5]))
+                                if self.object_array_source == 'depth':
+                                    self.pack_metric_object(
+                                        objects_msg, obstacle_msg, x, y, z, size_x, size_y, size_z,
+                                        result.names.get(int(cls)), conf,
+                                        track_ids[i] if track_ids is not None else None)
 
                     if self.use_pointcloud and (self.images['pointcloud'] is not None):
                         with self.profiler.measure("pointcloud_projection"):
@@ -1332,13 +1376,14 @@ class ImageObstacleDetectionNode(Node):
                                     i, x, y, z, size_x, size_y, size_z, frame_id,
                                     self.msg_metadata['pointcloud'].get('msg_timestamp'), conf, result.names.get(int(cls)), track_id=None, quat=quat,
                                     rgba=[0.0, 1.0, 0.0, 0.5]))
+                            if self.object_array_source == 'pointcloud':
+                                self.pack_metric_object(
+                                    objects_msg, obstacle_msg, x, y, z, size_x, size_y, size_z,
+                                    result.names.get(int(cls)), conf,
+                                    track_ids[i] if track_ids is not None else None, quat=quat)
 
             # publish messages
-            if self.publish_object_array and hasattr(self, 'object_array_pub'):
-                self.object_array_pub.publish(objects_msg)
-
-            if obstacle_msg is not None and hasattr(self, 'obstacle_detection_pub'):
-                self.obstacle_detection_pub.publish(obstacle_msg)
+            self._publish_object_arrays(objects_msg, obstacle_msg)
 
             if self.project_to_3d:
                 if self.use_depth:
@@ -2055,6 +2100,14 @@ class ImageObstacleDetectionNode(Node):
                         if not getattr(self, '_nav2_warned', False):
                             self.get_logger().warning("nav2_dynamic_msgs not available; nav2 ObstacleArray output disabled")
                             self._nav2_warned = True
+            elif param.name == 'object_array_source' and param.type_ == Parameter.Type.STRING:
+                if param.value in ('depth', 'pointcloud'):
+                    self.object_array_source = param.value
+                else:
+                    result.successful = False
+                    result.reason = (f"object_array_source must be 'depth' or 'pointcloud', "
+                                     f"got '{param.value}'.")
+                    self.get_logger().warn(result.reason)
             elif param.name == 'publish_debug_image' and param.type_ == Parameter.Type.BOOL:
                 self.publish_debug_image = param.value
             elif param.name == 'model_path' and param.type_ == Parameter.Type.STRING:

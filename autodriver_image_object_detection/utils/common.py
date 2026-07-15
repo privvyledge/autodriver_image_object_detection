@@ -28,7 +28,14 @@ def pack_2d_detection(x, y, size_x, size_y, class_id, conf, id):
     return detection
 
 
-def pack_nav2_obstacle_msg(x, y, size_x, size_y, class_id, conf, id=None, z_size=1.0):
+def pack_nav2_obstacle_msg(x, y, size_x, size_y, class_id, conf, id=None, z=0.0, z_size=1.0):
+    """Pack a metric 3D object into a nav2_dynamic_msgs/Obstacle.
+
+    Position and size are METRES in the frame named by the enclosing
+    ObstacleArray header — never pixels. Callers without a depth or
+    pointcloud projection have no metric object to publish and should emit
+    vision_msgs/Detection2DArray instead.
+    """
     if id in (None, -1):
         uuid_ = uuid.uuid4()
     else:
@@ -42,26 +49,42 @@ def pack_nav2_obstacle_msg(x, y, size_x, size_y, class_id, conf, id=None, z_size
     obstacle_msg.score = float(conf)
     obstacle_msg.position.x = float(x)
     obstacle_msg.position.y = float(y)
+    obstacle_msg.position.z = float(z)
     obstacle_msg.size.x = float(size_x)
     obstacle_msg.size.y = float(size_y)
-    obstacle_msg.size.z = float(z_size)  # 0.0
+    obstacle_msg.size.z = float(z_size)
     return obstacle_msg
 
-def pack_derived_object_msg(x, y, size_x, size_y, class_id, conf, id=None, z_size=1.0):
-    """Convert a nav2_dynamic_msgs/Obstacle into a derived_object_msgs/Object."""
+def pack_derived_object_msg(x, y, size_x, size_y, class_id, conf, id=None, z=0.0, z_size=1.0,
+                            quat=None, tracked=True):
+    """Pack a metric 3D object into a derived_object_msgs/Object.
+
+    Position and size are METRES in the frame named by the enclosing ObjectArray
+    header — never pixels. Callers without a depth or pointcloud projection have
+    no metric object to publish and should emit vision_msgs/Detection2DArray
+    instead.
+
+    shape is always SolidPrimitive.BOX with dimensions [size_x, size_y, z_size].
+    polygon is left empty; twist and accel are always zero (no velocity estimate
+    is produced here). quat orients the box when the caller has an OBB, else the
+    orientation is identity. tracked selects OBJECT_TRACKED vs OBJECT_DETECTED.
+    """
     obj = Object()
     # Convert first 4 bytes of the obstacle's UUID into a uint32 id.
     if id in (None, -1):
         id = 10000000
     obj.id = id
 
-    # Set detection level. Here we assume that an obstacle from tracking
-    # is equivalent to a TRACKED object.
-    obj.detection_level = Object.OBJECT_TRACKED
+    # Only objects carrying a tracker-assigned id are TRACKED; a per-frame
+    # detection without one is DETECTED.
+    obj.detection_level = Object.OBJECT_TRACKED if tracked else Object.OBJECT_DETECTED
 
-    # Set pose. Use the obstacle's position and set a default orientation.
-    obj.pose.position = Point(x=float(x), y=float(y), z=0.0)
-    obj.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+    obj.pose.position = Point(x=float(x), y=float(y), z=float(z))
+    if quat is None:
+        obj.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+    else:
+        obj.pose.orientation = Quaternion(
+            x=float(quat[0]), y=float(quat[1]), z=float(quat[2]), w=float(quat[3]))
 
     # Set twist using the obstacle's velocity; angular part is set to zero.
     obj.twist.linear = Vector3(x=0.0, y=0.0, z=0.0)

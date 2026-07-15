@@ -10,15 +10,8 @@ from rclpy.parameter import Parameter
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType, SetParametersResult
 from sensor_msgs.msg import Image, CompressedImage, CameraInfo
 from vision_msgs.msg import Detection2DArray
-from derived_object_msgs.msg import ObjectArray
-
-try:
-    from nav2_dynamic_msgs.msg import ObstacleArray
-except ImportError:
-    print('nav2_dynamic_msgs not found.')
 
 from autodriver_image_object_detection.base_detector import BaseDetector
-from autodriver_image_object_detection.utils.common import pack_derived_object_msg, pack_nav2_obstacle_msg
 from autodriver_image_object_detection.utils.imaging_utils import parse_image_message
 from autodriver_image_object_detection.utils.profiling import setup_profiler, apply_profiler_param
 
@@ -93,12 +86,6 @@ class SingleStreamDetector(BaseDetector):
         # Publishers
         self.detection_results_pub = self.create_publisher(
             Detection2DArray, self.detection_results_topic, self.queue_size)
-        self.object_array_pub = self.create_publisher(ObjectArray, 'yolo/objects', self.queue_size)
-        try:
-            self.obstacle_detection_pub = self.create_publisher(
-                ObstacleArray, 'yolo/obstacles', self.queue_size)
-        except NameError:
-            self.obstacle_detection_pub = None
 
         if self.publish_debug_image:
             self.detection_image_pub = self.create_publisher(
@@ -238,46 +225,14 @@ class SingleStreamDetector(BaseDetector):
     # --------------------------------------------------------------- parsing
 
     def parse_results(self, results, header):
+        # Image-only node: detections stay in pixel space and are published as
+        # vision_msgs/Detection2DArray. Metric ObjectArray/ObstacleArray output
+        # requires a depth or pointcloud projection and lives in yolo_detection_node.
         if results is None:
             return None, None, None
-        return self.create_detections_array(results, header)
-
-    def create_detections_array(self, results, header):
-        """Extend the base 2D array with ObjectArray and ObstacleArray side-publications."""
         if not results:
             return Detection2DArray(), None, None
-
-        # Base class builds Detection2DArray, renders annotated image, composites mask
-        detections_msg, detection_image, mask_img = super().create_detections_array(
-            results[0], header)
-
-        objects_msg = ObjectArray()
-        objects_msg.header.stamp = header.stamp
-        objects_msg.header.frame_id = header.frame_id
-
-        try:
-            obstacle_msg = ObstacleArray()
-            obstacle_msg.header.stamp = header.stamp
-            obstacle_msg.header.frame_id = header.frame_id
-        except NameError:
-            obstacle_msg = None
-
-        for det in detections_msg.detections:
-            x, y = det.bbox.center.position.x, det.bbox.center.position.y
-            w, h = det.bbox.size_x, det.bbox.size_y
-            cls_name = det.results[0].hypothesis.class_id
-            conf = det.results[0].hypothesis.score
-            id_ = int(det.id) if det.id else -1
-            objects_msg.objects.append(pack_derived_object_msg(x, y, w, h, cls_name, conf, id=id_))
-            if obstacle_msg is not None:
-                obstacle_msg.obstacles.append(
-                    pack_nav2_obstacle_msg(x, y, w, h, cls_name, conf, id=id_, z_size=0.0))
-
-        self.object_array_pub.publish(objects_msg)
-        if obstacle_msg is not None and self.obstacle_detection_pub is not None:
-            self.obstacle_detection_pub.publish(obstacle_msg)
-
-        return detections_msg, detection_image, mask_img
+        return self.create_detections_array(results[0], header)
 
     # ------------------------------------------------------- parameter callback
 
