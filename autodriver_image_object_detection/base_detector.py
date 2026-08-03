@@ -46,6 +46,16 @@ class BaseDetector(Node):
     override _param_defaults() and return a dict of {param_name: default_value}.
     """
 
+    #: Parameter names consumed by parameter_change_callback. Subclasses that
+    #: reject parameters they do not recognise consult this so they do not fail
+    #: the common ones the base class already handled.
+    COMMON_RECONFIGURABLE_PARAMS = frozenset({
+        'publish_debug_image', 'track_2d', 'tracker_2d.path', 'plot_tracks',
+        'use_gpu', 'show_image', 'use_image_dimensions', 'image_dimensions',
+        'resize_image', 'half_precision', 'conf_thresh', 'iou_thresh', 'max_det',
+        'classes', 'agnostic_nms', 'augment', 'verbose', 'static_camera_info',
+    })
+
     def __init__(self, node_name: str):
         super().__init__(node_name)
         self._init_callback_groups()
@@ -308,27 +318,49 @@ class BaseDetector(Node):
             self._setup_tracker_config()
 
     def _resolve_classes(self) -> None:
-        """Normalise self.classes to a list of integer class IDs."""
+        """Normalise self.classes to a list of integer class IDs.
+
+        Unsupported names/ids are logged and dropped rather than raising, so one
+        stale entry in a launch file does not stop the node from starting. Only
+        an entirely unsupported list is fatal.
+        """
         classes = self.classes
         if not classes:
             self.classes = list(range(len(self.class_names)))
             return
         if isinstance(classes, int):
-            self.classes = [classes]
+            classes = [classes]
+        elif isinstance(classes, str):
+            classes = [int(x.strip()) for x in classes.split(',')]
+        elif not isinstance(classes, (list, tuple)):
+            self.classes = list(classes)
             return
-        if isinstance(classes, str):
-            self.classes = [int(x.strip()) for x in classes.split(',')]
+
+        # Drop empty strings/None but keep class id 0. A list that filters down to
+        # nothing (e.g. ['']) means "no filter", same as an empty list.
+        classes = [c for c in classes if c or c == 0]
+        if not classes:
+            self.classes = list(range(len(self.class_names)))
             return
-        if isinstance(classes, (list, tuple)):
-            classes = [c for c in classes if c or c == 0]
-            if classes and isinstance(classes[0], str):
-                assert all(c in self.supported_class_names for c in classes)
-                self.classes = [self.class_names_inv[c.strip()] for c in classes]
-            else:
-                assert all(c in self.supported_class_keys for c in classes)
-                self.classes = [int(c) for c in classes]
-            return
-        self.classes = list(classes)
+        if isinstance(classes[0], str):
+            requested = [c.strip() for c in classes]
+            unknown = [c for c in requested if c not in self.supported_class_names]
+            resolved = [self.class_names_inv[c] for c in requested
+                        if c in self.supported_class_names]
+            supported = sorted(self.supported_class_names)
+        else:
+            requested = [int(c) for c in classes]
+            unknown = [c for c in requested if c not in self.supported_class_keys]
+            resolved = [c for c in requested if c in self.supported_class_keys]
+            supported = f'0..{len(self.class_names) - 1}'
+
+        if unknown:
+            self.get_logger().error(
+                f'Ignoring unsupported class(es) {unknown}. The loaded model supports: {supported}')
+        if not resolved:
+            raise ValueError(
+                f'None of the requested classes {requested} are supported by the model.')
+        self.classes = resolved
 
     def _setup_inference_dict(self) -> None:
         """Initialise self.imgsz and self.inference_dict for detect_objects()."""
