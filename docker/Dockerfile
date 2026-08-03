@@ -353,7 +353,11 @@ ENV RCUTILS_COLORIZED_OUTPUT=1 \
     RCUTILS_CONSOLE_OUTPUT_FORMAT="[{severity} {time}] [{name}]: {message} ({function_name}() at {file_name}:{line_number})" \
     _colcon_cd_root=${ROS_ROOT}
 
-ENV PYTHONPATH="${PYTHONPATH}:/usr/local/lib"
+# Set outright rather than appended to ${PYTHONPATH}: nothing above defines it, so the
+# expansion was empty and baked a leading colon into the value. An empty PYTHONPATH entry
+# resolves to the current working directory, which then shadows site-packages on sys.path.
+# ROS's setup.bash prepends its own entries to this at container start.
+ENV PYTHONPATH="/usr/local/lib"
 
 RUN echo 'alias build="colcon build --symlink-install --event-handlers console_direct+"' >> /etc/bash.bashrc && \
     echo "source /usr/share/colcon_cd/function/colcon_cd.sh" >> /etc/bash.bashrc && \
