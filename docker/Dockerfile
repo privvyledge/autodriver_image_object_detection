@@ -230,8 +230,19 @@ RUN python3.10 -m pip install \
 # Install PyTorch
 RUN sudo apt purge python3-sympy -y && python3.10 -m pip install "torch==2.5.1" "torchvision==0.20.1" --index-url https://download.pytorch.org/whl/cu124
 
-# Install tensorrt
-RUN python3.10 -m pip install tensorrt-cu12 tensorrt-lean-cu12 tensorrt-dispatch-cu12
+# Install tensorrt.
+# Pinned to the 10.x line. Rationale:
+#   - matches the CUDA 12.4 base image / torch cu124 (11.2.x targets CUDA 12.9+)
+#   - ships prebuilt manylinux wheels; the unpinned 11.2.x resolution is sdist-only and
+#     repacks a 4.09 GiB wheel at build time, which then repeatedly failed to unpack with
+#     "BadZipFile: Bad CRC-32". The 10.7 wheel (1.93 GiB, prebuilt) installs cleanly.
+#     Why the repack corrupts was never established -- only that pinning avoids it.
+#   - satisfies ultralytics' runtime check_requirements("tensorrt>7.0.0,!=10.1.0")
+ARG TENSORRT_VERSION=10.7.0.post1
+RUN python3.10 -m pip install --retries 5 --timeout 120 \
+    "tensorrt-cu12==${TENSORRT_VERSION}" \
+    "tensorrt-lean-cu12==${TENSORRT_VERSION}" \
+    "tensorrt-dispatch-cu12==${TENSORRT_VERSION}"
 
 ## Install Tensorflow with CUDA support and a version with CuDNN <= 9.1.0 since the base image has that installed
 #RUN python3.10 -m pip install "tensorflow[and-cuda]==2.17.0" keras
@@ -249,7 +260,15 @@ RUN sudo apt-get update && \
     cd ultralytics && \
     python3.10 -m pip install --upgrade pip wheel "setuptools==70.0.0" && \
     cd ${HOME}/ultralytics/ && python3.10 -m pip install -e ".[export]" "lap>=0.5.12" dill onnxslim && \
-    python3.10 -m pip install "numpy==1.26.4" && \
+    # cv_bridge here is compiled against OpenCV 4.5.4 AND NumPy 1.x, so both are pinned
+    # together in one resolve -- pinning them in separate pip calls lets the second call
+    # silently undo the first. Constraints:
+    #   opencv-python 5.x renumbered multi-channel type constants (CV_8UC3 16->64,
+    #     CV_8UC4 24->96) -> cv_bridge "KeyError: 16" on every bgr8/rgb8/bgra8/rgba8.
+    #   opencv-python >=4.12 requires numpy>=2 -> cv_bridge.boost "_ARRAY_API not found",
+    #     then SIGSEGV / "double free or corruption".
+    #   4.10.0.84 needs only numpy>=1.21.2 on py3.10, and satisfies ultralytics (>=4.6.0).
+    python3.10 -m pip install "opencv-python==4.10.0.84" "numpy==1.26.4" && \
     sudo rm -rf /var/lib/apt/lists/*
 
 # Install Open3D. Must precede the colcon build so packages that link against it
@@ -294,7 +313,14 @@ RUN sudo apt-get update -y && DEBIAN_FRONTEND="noninteractive" sudo apt-get inst
     gstreamer1.0-rtsp && \
     sudo rm -rf /var/lib/apt/lists/*
 
-RUN sudo apt-get update -y && DEBIAN_FRONTEND="noninteractive" sudo apt-get install -y --no-install-recommends \
+# NVIDIA's CUDA apt index is periodically out of sync with its own Release file
+# ("File has unexpected size ... Mirror sync in progress?"), which makes apt-get update
+# exit 100. This Dockerfile installs nothing from that repo -- CUDA comes from the base
+# image and every cuda-*/libcudnn apt line here is commented out -- so the list is set
+# aside for the duration of the update and restored afterwards. The final image is
+# unchanged; drop this workaround once the upstream index is consistent again.
+RUN sudo mv /etc/apt/sources.list.d/cuda-ubuntu2204-x86_64.list /tmp/cuda.list.disabled && \
+    sudo apt-get update -y && DEBIAN_FRONTEND="noninteractive" sudo apt-get install -y --no-install-recommends \
     ros-${ROS_DISTRO}-tf2-tools \
     ros-${ROS_DISTRO}-tf-transformations \
     ros-${ROS_DISTRO}-rqt-tf-tree \
@@ -306,6 +332,7 @@ RUN sudo apt-get update -y && DEBIAN_FRONTEND="noninteractive" sudo apt-get inst
     ros-${ROS_DISTRO}-shape-msgs && \
     sudo apt purge python3-transforms3d -y && \
     python3.10 -m pip install "transforms3d==0.4.2" && \
+    sudo mv /tmp/cuda.list.disabled /etc/apt/sources.list.d/cuda-ubuntu2204-x86_64.list && \
     sudo rm -rf /var/lib/apt/lists/*
 
 # Build ROS2 packages
@@ -334,7 +361,9 @@ RUN echo 'alias build="colcon build --symlink-install --event-handlers console_d
     echo "source /ros2_ws/install/setup.bash" >> /etc/bash.bashrc
 
 ## Todo: remove the lines below in Release/production version
-RUN sudo apt update && sudo apt install gedit cheese nautilus net-tools iputils-ping nano -y
+RUN sudo mv /etc/apt/sources.list.d/cuda-ubuntu2204-x86_64.list /tmp/cuda.list.disabled && \
+    sudo apt update && sudo apt install gedit cheese nautilus net-tools iputils-ping nano -y && \
+    sudo mv /tmp/cuda.list.disabled /etc/apt/sources.list.d/cuda-ubuntu2204-x86_64.list
 
 
 CMD ["/bin/bash"]
