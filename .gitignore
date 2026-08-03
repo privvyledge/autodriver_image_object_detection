@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+*.so
+
+# colcon / ament build output
+build/
+install/
+log/
+
+# Model weights and compiled inference engines (multi-hundred-MB; fetched or
+# exported at runtime by base_detector.load_model)
+*.pt
+*.onnx
+*.engine
+*.trt
+*.plan
+
+# Ultralytics sample assets downloaded at runtime
+bus.jpg
+zidane.jpg
+
+# Scratch / working copies (see CLAUDE.md: these are dead stubs, not source)
+temp*.py
+*.py~
+*.orig
+*.rej
+
+# Private tooling and agent context — must never be committed
+CLAUDE.md
+PLAN.md
+HANDOFF.md
+commit.txt
+.claude/
+.codegraph/
+.remember/
+graphify-out/
+
+# Runtime state written by scripts/interactive_cv_gui.py and roi_tracker_counter.py
+scripts/objects*.json
+scripts/counts.json
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

@@ -252,6 +252,11 @@ RUN sudo apt-get update && \
     python3.10 -m pip install "numpy==1.26.4" && \
     sudo rm -rf /var/lib/apt/lists/*
 
+# Install Open3D. Must precede the colcon build so packages that link against it
+# (autodriver_pointcloud_preprocessor) resolve it at build time; open3d/python3-open3d
+# are in SKIPPED_ROSDEP_KEYS because rosdep cannot supply this version.
+RUN sudo apt purge python3-blinker -y && python3.10 -m pip install "open3d==0.19.0"
+
 ARG ROS_VERSION="ROS2"
 ARG ROS_DISTRO="humble"
 ENV ROS_DISTRO=${ROS_DISTRO}
@@ -265,6 +270,7 @@ WORKDIR ${BUILD_HOME}
 
 RUN cd ${BUILD_HOME}/src && \
     git clone https://github.com/privvyledge/autodriver_image_object_detection.git -b batch_inference_and_tracking && \
+    git clone https://github.com/privvyledge/autodriver_pointcloud_preprocessor.git && \
     git clone https://github.com/privvyledge/ros_images_to_files.git && \
     git clone https://github.com/privvyledge/ros_multi_object_tracker.git
 
@@ -326,10 +332,6 @@ RUN echo 'alias build="colcon build --symlink-install --event-handlers console_d
     echo "source /usr/share/colcon_cd/function/colcon_cd.sh" >> /etc/bash.bashrc && \
     echo "source /opt/ros/humble/setup.bash" >> /etc/bash.bashrc && \
     echo "source /ros2_ws/install/setup.bash" >> /etc/bash.bashrc
-
-## todo:remove this
-# Install Open3D 0.19.0 using pip
-RUN sudo apt purge python3-blinker -y && python3.10 -m pip install "open3d==0.19.0"
 
 ## Todo: remove the lines below in Release/production version
 RUN sudo apt update && sudo apt install gedit cheese nautilus net-tools iputils-ping nano -y
