@@ -91,6 +91,83 @@ def preprocess_pointcloud(
     return points[mask]
 
 
+DEPTH_GAP_BASE = 0.10
+DEPTH_GAP_REL = 0.02
+DEPTH_TAIL_PERCENTILE = 5.0
+
+
+def select_object_depths(depths: np.ndarray, seed_z: float = None,
+                         gap_base: float = DEPTH_GAP_BASE,
+                         gap_rel: float = DEPTH_GAP_REL,
+                         tail_percentile: float = DEPTH_TAIL_PERCENTILE):
+    """Isolate an object's own depth surface from background bleeding into its ROI.
+
+    A detection's depth samples are a mixture: the object's visible surface plus
+    whatever shows through mask edges or fills a bbox-only ROI. Taking min/max
+    over that mixture makes the view-axis extent a function of the background,
+    not the object.
+
+    Two filters run in order, because they remove different things:
+
+    1. **Gap segmentation.** Sort the depths and split wherever consecutive
+       samples differ by more than ``tolerance``; keep the run containing
+       ``seed_z``. This removes *disconnected* background — a wall behind a
+       chair, sky behind a car — which is what a fixed-size window cannot do.
+    2. **Tail trim.** Take percentiles inside the surviving run. This removes
+       *connected* ramps, e.g. floor receding from the object's base, which are
+       contiguous in depth and so survive step 1.
+
+    Segmenting by contiguity rather than by an absolute size window is what lets
+    one default serve very different scales: an object's surface is continuous in
+    depth whatever its size, while the step to the background behind it is large.
+    ``tolerance = gap_base + gap_rel * seed_z`` grows with range so that depth
+    noise, which also grows with range, does not shatter a far object's surface
+    into fragments.
+
+    Args:
+        depths: 1-D array of valid depth samples in metres (finite, > 0).
+        seed_z: depth believed to lie on the object; defaults to the median.
+        gap_base: contiguity tolerance at zero range (metres).
+        gap_rel: added tolerance per metre of range (dimensionless).
+        tail_percentile: percentage trimmed from each tail of the kept run.
+
+    Returns:
+        ``(z_center, z_lo, z_hi)`` in metres — the object's median range and its
+        trimmed near/far bounds — or ``None`` if ``depths`` is empty.
+    """
+    depths = np.asarray(depths, dtype=np.float64).ravel()
+    if depths.size == 0:
+        return None
+
+    order = np.sort(depths)
+    if seed_z is None:
+        seed_z = float(np.median(order))
+
+    # Step 1: keep the contiguous run of depths containing the seed.
+    tolerance = gap_base + gap_rel * max(seed_z, 0.0)
+    if order.size > 1:
+        # Split points are the indices just after each gap wider than tolerance.
+        breaks = np.flatnonzero(np.diff(order) > tolerance) + 1
+        if breaks.size:
+            starts = np.concatenate(([0], breaks))
+            ends = np.concatenate((breaks, [order.size]))
+            # searchsorted gives the run whose value range brackets the seed; when
+            # the seed falls inside a gap, clamp to the nearest run rather than
+            # dropping the detection.
+            idx = int(np.clip(np.searchsorted(order, seed_z, side='right') - 1,
+                              0, order.size - 1))
+            run = int(np.searchsorted(ends, idx, side='right'))
+            order = order[starts[run]:ends[run]]
+
+    if order.size == 0:
+        return None
+
+    # Step 2: trim the tails of the surviving run.
+    z_lo = float(np.percentile(order, tail_percentile))
+    z_hi = float(np.percentile(order, 100.0 - tail_percentile))
+    return float(np.median(order)), z_lo, max(z_hi, z_lo)
+
+
 def project_depth_to_3d(bbox_xywh, depth_image: np.ndarray, camera_model, depth_scale: float, mask=None):
     """Back-project a single 2D detection to 3D using a depth image.
 
@@ -114,10 +191,9 @@ def project_depth_to_3d(bbox_xywh, depth_image: np.ndarray, camera_model, depth_
 
     Returns:
         (x3d, y3d, z3d, z_extent) in the camera (optical) frame, or None on failure.
-        z3d is the robust centroid range (median); z_extent is the view-axis depth
-        spread (10-90th percentile span) the caller can use as a measured box depth.
-        Percentiles, not min/max, so background pixels bleeding into a bbox-only ROI
-        don't blow up the extent (mask ROIs are already tight).
+        z3d is the robust centroid range; z_extent is the view-axis depth spread.
+        Both come from select_object_depths, so background bleeding into the ROI
+        is segmented off rather than measured as object depth.
     """
     cx, cy = int(bbox_xywh[0]), int(bbox_xywh[1])
     w, h = int(bbox_xywh[2]), int(bbox_xywh[3])
@@ -141,9 +217,10 @@ def project_depth_to_3d(bbox_xywh, depth_image: np.ndarray, camera_model, depth_
     if valid.size == 0:
         return None
 
-    z = float(np.median(valid))                       # robust centroid range
-    z_lo = float(np.percentile(valid, 10))
-    z_hi = float(np.percentile(valid, 90))
+    selected = select_object_depths(valid)
+    if selected is None:
+        return None
+    z, z_lo, z_hi = selected                          # robust centroid range + bounds
     z_extent = max(z_hi - z_lo, 0.0)                  # view-axis depth spread
     ray = camera_model.projectPixelTo3dRay((cx, cy))
     scale = z / ray[2]

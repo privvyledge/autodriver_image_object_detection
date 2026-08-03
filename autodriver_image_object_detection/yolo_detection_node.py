@@ -127,6 +127,7 @@ from tf2_ros import TransformBroadcaster, TransformListener, Buffer, LookupExcep
 from autodriver_image_object_detection.utils.common import pack_2d_detection, pack_nav2_obstacle_msg, pack_derived_object_msg, update_tracker_param, make_deleteall_marker_array
 from autodriver_image_object_detection.utils.imaging_utils import parse_image_message as _parse_image_message
 from autodriver_image_object_detection.utils.profiling import setup_profiler, apply_profiler_param
+from autodriver_image_object_detection.utils.pointcloud_utils import select_object_depths
 
 if OPEN3D_AVAILABLE:
     from autodriver_pointcloud_preprocessor.core import PointcloudPreprocessor, PreprocessorConfig
@@ -144,6 +145,10 @@ if OPEN3D_AVAILABLE:
 
 
 class ImageObstacleDetectionNode(Node):
+    # Floor for the measured view-axis box extent (metres), so a head-on flat
+    # surface still produces a box with visible thickness.
+    MIN_DEPTH_THICKNESS = 0.2
+
     def __init__(self):
         this_package_dir = get_package_share_directory('autodriver_image_object_detection')
         super(ImageObstacleDetectionNode, self).__init__("image_obstacle_detection_node")
@@ -265,9 +270,16 @@ class ImageObstacleDetectionNode(Node):
         self.declare_parameter('static_camera_to_robot_tf', True)
         self.declare_parameter('depth_scale', 1.0)  # mm to meters. 1.0 for Carla (32FC1), 1000.0 for Realsense (16UC1)
         self.declare_parameter('depth_max', 50.0)  # meters. 1000. for Carla, 6.0 for Realsense
-        # upper bound on the 3D box extent along the camera view axis (meters);
-        # rejects background depth pixels bleeding through the mask edges
+        # last-resort upper bound on the 3D box extent along the camera view axis
+        # (meters); the depth_gap_* settings below do the actual background rejection
         self.declare_parameter('depth_box_thickness', 4.0)
+        # Depth samples in a detection's ROI are split into surfaces wherever
+        # consecutive depths differ by more than (depth_gap_base + depth_gap_rel * z),
+        # and only the surface containing the object is measured. The tolerance is
+        # about depth *continuity*, not object size, so one setting covers a chair at
+        # 2 m and a vehicle at 15 m; the relative term absorbs range-dependent noise.
+        self.declare_parameter('depth_gap_base', 0.10)
+        self.declare_parameter('depth_gap_rel', 0.02)
         self.declare_parameter(name='normalize_depth', value=False, descriptor=ParameterDescriptor(
                 description='',
                 type=ParameterType.PARAMETER_BOOL))
@@ -356,6 +368,8 @@ class ImageObstacleDetectionNode(Node):
         self.depth_max = self.get_parameter("depth_max").get_parameter_value().double_value
         self.depth_box_thickness = self.get_parameter(
             "depth_box_thickness").get_parameter_value().double_value
+        self.depth_gap_base = self.get_parameter("depth_gap_base").get_parameter_value().double_value
+        self.depth_gap_rel = self.get_parameter("depth_gap_rel").get_parameter_value().double_value
         self.normalize_depth = self.get_parameter("normalize_depth").get_parameter_value().bool_value
         self.normalized_max = self.get_parameter("normalized_max").get_parameter_value().double_value
 
@@ -1592,17 +1606,19 @@ class ImageObstacleDetectionNode(Node):
                     depth_image[bbox_center_y][bbox_center_x] / self.depth_scale
             )
 
-        # Step 6: keep only depths within the box-thickness window around the
-        # object distance — mask bleed otherwise pulls background pixels in and
-        # inflates the box to tens of meters along the view axis
-        z_diff = np.abs(roi - bb_center_z_coord)
-        mask_z = z_diff <= (self.depth_box_thickness / 2.0)
-        if not np.any(mask_z):
+        # Step 6: separate the object's own depth surface from background bleed.
+        # A fixed window around the object distance cannot do this at more than one
+        # scale — it is either too tight for a car at range or too loose for a chair
+        # at 2 m, where a wall 1.5 m behind sits well inside a 4 m window and gets
+        # measured as object depth. select_object_depths segments by depth
+        # contiguity instead, so the same settings hold across sensors and scenes.
+        selected = select_object_depths(roi, seed_z=float(bb_center_z_coord),
+                                        gap_base=self.depth_gap_base,
+                                        gap_rel=self.depth_gap_rel)
+        if selected is None:
             return None, None, None, None, None, None, None, None
 
-        roi = roi[mask_z]
-        z_min, z_max = np.min(roi), np.max(roi)
-        z = float(bb_center_z_coord)
+        z, z_min, z_max = selected
 
         if z == 0:
             return None, None, None, None, None, None, None, None
@@ -1616,7 +1632,10 @@ class ImageObstacleDetectionNode(Node):
 
         size_x = z * (bbox_size_x / fx)
         size_y = z * (bbox_size_y / fy)
-        size_z = float(z_max - z_min)
+        # Measured view-axis extent, floored so a flat surface still yields a visible
+        # box and capped by depth_box_thickness as a last-resort upper bound.
+        size_z = float(min(max(z_max - z_min, self.MIN_DEPTH_THICKNESS),
+                           self.depth_box_thickness))
 
         if len(rows) == 0:
             return None, None, None, None, None, None, None, None
@@ -2201,6 +2220,18 @@ class ImageObstacleDetectionNode(Node):
                 self.publish_empty_detections = param.value
             elif param.name == 'depth_box_thickness' and param.type_ == Parameter.Type.DOUBLE:
                 self.depth_box_thickness = param.value
+            elif param.name == 'depth_gap_base' and param.type_ == Parameter.Type.DOUBLE:
+                if param.value > 0.0:
+                    self.depth_gap_base = param.value
+                else:
+                    result.successful = False
+                    result.reason = 'depth_gap_base must be > 0.'
+            elif param.name == 'depth_gap_rel' and param.type_ == Parameter.Type.DOUBLE:
+                if param.value >= 0.0:
+                    self.depth_gap_rel = param.value
+                else:
+                    result.successful = False
+                    result.reason = 'depth_gap_rel must be >= 0.'
             elif param.name == 'cluster_selection' and param.type_ == Parameter.Type.STRING:
                 if param.value.lower() in ('largest', 'closest', 'first'):
                     self.cluster_selection = param.value.lower()
