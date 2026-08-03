@@ -34,7 +34,6 @@ class SingleStreamDetector(BaseDetector):
         self.declare_parameter('detection_image_topic', 'yolo/detection_image')
         self.declare_parameter('segmentation_image_topic', 'yolo/segmentation_image')
         self.declare_parameter('segmentation_mask_image_topic', 'yolo/segmentation_mask_image')
-        self.declare_parameter('update_class', '')  # "class_name" to add, "-class_name" to remove
 
         # Read common params into self.*
         self._read_common_params()
@@ -48,7 +47,6 @@ class SingleStreamDetector(BaseDetector):
         self.detection_image_topic = gp('detection_image_topic').get_parameter_value().string_value
         self.segmentation_image_topic = gp('segmentation_image_topic').get_parameter_value().string_value
         self.segmentation_mask_image_topic = gp('segmentation_mask_image_topic').get_parameter_value().string_value
-        self.update_class = gp('update_class').get_parameter_value().string_value
 
         # Device + model
         self._setup_device()
@@ -246,27 +244,6 @@ class SingleStreamDetector(BaseDetector):
             elif name == 'model_path' and ptype == Parameter.Type.STRING:
                 self.model_path = val
                 # todo: reload model
-            elif name == 'update_class' and ptype == Parameter.Type.STRING:
-                self.update_class = val
-                mode, cls = ('remove', val[1:]) if val.startswith('-') else ('add', val)
-                if cls not in self.supported_class_names:
-                    result.successful = False
-                    result.reason = f"'{cls}' is not a supported class name."
-                    self.get_logger().warn(f"'{cls}' is not a supported class name.")
-                else:
-                    cls_key = self.class_names_inv.get(cls.strip())
-                    if mode == 'add' and cls_key not in self.classes:
-                        self.classes.append(cls_key)
-                        self.get_logger().info(f"Added '{cls}' to detection classes.")
-                    elif mode == 'remove' and cls_key in self.classes:
-                        self.classes.remove(cls_key)
-                        self.get_logger().info(f"Removed '{cls}' from detection classes.")
-                    self.inference_dict['classes'] = self.classes
-                    self.set_parameters([
-                        Parameter(
-                            'classes', Parameter.Type.STRING_ARRAY,
-                            [self.class_names[x] for x in self.classes])
-                    ])
             self.get_logger().info(f'Param {param.name} → {param.value}: success={result.successful}')
         return result
 

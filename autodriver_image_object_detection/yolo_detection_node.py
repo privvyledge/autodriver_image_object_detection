@@ -213,7 +213,6 @@ class ImageObstacleDetectionNode(BaseDetector):
                                        type=ParameterType.PARAMETER_STRING))
         self.declare_parameter('track_3d', True)  # todo: implement 3D tracking
         self.declare_parameter('synchronization_interval', 0.1)
-        self.declare_parameter("update_class", "")  # type "class_name" to add or "-class_name" to delete
         self.declare_parameter("transform_timeout", 2.0)  # 0.1
         self.declare_parameter("project_to_3d", True)  # todo: remove this flag and just use depth or pointcloud
         self.declare_parameter("publish_empty_detections", True)  # heartbeat: publish empty 3D + DELETEALL markers on zero-detection frames
@@ -288,7 +287,6 @@ class ImageObstacleDetectionNode(BaseDetector):
         self.pointcloud_topic = self.get_parameter('pointcloud_topic').value
         self.track_3d = self.get_parameter('track_3d').value
         self.synchronization_interval = self.get_parameter('synchronization_interval').value
-        self.update_class = self.get_parameter("update_class").value
         self.project_to_3d = self.get_parameter("project_to_3d").get_parameter_value().bool_value
         self.publish_empty_detections = self.get_parameter("publish_empty_detections").get_parameter_value().bool_value
         self.use_depth = self.get_parameter("use_depth").get_parameter_value().bool_value
@@ -1409,7 +1407,9 @@ class ImageObstacleDetectionNode(BaseDetector):
         labels = o3d_pcd.cluster_dbscan(
             eps=self.cluster_tolerance,
             min_points=self.min_cluster_size,
-            print_progress=True  # todo: set to False
+            # Open3D's progress bar goes to stdout once per detection per frame and was
+            # the visible bottleneck in a bag replay (~25 s on one frame under load).
+            print_progress=False
         )
         # o3d_pcd.point.labels = labels  # if adding label, create a new Pointcloud Tensor Geometry object in each callback
 
@@ -1741,41 +1741,6 @@ class ImageObstacleDetectionNode(BaseDetector):
             elif param.name == 'model_path' and param.type_ == Parameter.Type.STRING:
                 self.model_path = param.value
                 # todo: load the model
-            elif param.name == 'update_class' and param.type_ == Parameter.Type.STRING:
-                # Update the list of classes based on the update_class parameter.
-                # For CLI, add -- before -class,
-                # e.g ros2 param set /single_stream_detector update_class -- -truck.
-                self.update_class = param.value
-                mode = "add"
-                cls = self.update_class
-                if self.update_class.startswith('-'):
-                    mode = "remove"
-                    cls = self.update_class[1:]
-                # check if the class name is supported
-                if cls not in self.supported_class_names:
-                    result.successful = False
-                    result.reason = f"'{cls}' is not a supported class name."
-                    self.get_logger().warn(f"'{cls}' is not a supported class name.")
-                # get the class key
-                cls_key = self.class_names_inv.get(cls.strip(), False)
-                # add or remove the class
-                if (mode == "add") and (cls_key not in self.classes):
-                    self.classes.append(cls_key)
-                    print(f"Added '{cls}' to the list of classes.")
-                elif (mode == "remove") and cls_key:
-                    self.classes.remove(cls_key)
-                    print(f"Removed '{cls}' from the list of classes.")
-                self.inference_dict['classes'] = self.classes
-                # update the classes parameter
-                self.set_parameters(
-                        [
-                            rclpy.parameter.Parameter(
-                                'classes',
-                                Parameter.Type.STRING_ARRAY,
-                                [self.class_names[x] for x in self.classes]
-                            )
-                        ]
-                )
             elif param.name == 'publish_empty_detections' and param.type_ == Parameter.Type.BOOL:
                 self.publish_empty_detections = param.value
             elif param.name == 'depth_box_thickness' and param.type_ == Parameter.Type.DOUBLE:

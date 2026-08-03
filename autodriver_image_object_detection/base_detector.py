@@ -54,6 +54,7 @@ class BaseDetector(Node):
         'use_gpu', 'show_image', 'use_image_dimensions', 'image_dimensions',
         'resize_image', 'half_precision', 'conf_thresh', 'iou_thresh', 'max_det',
         'classes', 'agnostic_nms', 'augment', 'verbose', 'static_camera_info',
+        'update_class',
     })
 
     def __init__(self, node_name: str):
@@ -109,6 +110,16 @@ class BaseDetector(Node):
         self.declare_parameter(
             'classes',
             d.get('classes', ['person', 'car', 'bicycle', 'motorcycle', 'bus', 'truck']),
+        )
+        self.declare_parameter(
+            'update_class',
+            d.get('update_class', ''),
+            ParameterDescriptor(
+                type=ParameterType.PARAMETER_STRING,
+                description='Add or remove one class from `classes` at runtime: "car" to add, '
+                            '"-car" to remove. On the CLI a leading dash needs `--`, e.g. '
+                            '`ros2 param set /<node> update_class -- -truck`.',
+            ),
         )
         self.declare_parameter('agnostic_nms', d.get('agnostic_nms', True))
         self.declare_parameter('augment', d.get('augment', False))
@@ -167,6 +178,7 @@ class BaseDetector(Node):
         self.iou_thresh = gp('iou_thresh').get_parameter_value().double_value
         self.max_det = gp('max_det').get_parameter_value().integer_value
         self.classes = list(gp('classes').value)
+        self.update_class = gp('update_class').get_parameter_value().string_value
         self.agnostic_nms = gp('agnostic_nms').get_parameter_value().bool_value
         self.augment = gp('augment').get_parameter_value().bool_value
         self.verbose = gp('verbose').get_parameter_value().bool_value
@@ -239,6 +251,10 @@ class BaseDetector(Node):
             did_export = True
             self.get_logger().info(f'Export complete: {self.model_path}')
 
+        # Kept alive across the block so a successfully validated exported model can be
+        # reused as self.model instead of loading a second backend (see below).
+        probe_model = None
+
         if model_path.suffix in ('.engine', '.onnx'):
             needs_export = False
             # Do NOT pre-check model_path.exists(): a relative model_path resolves against
@@ -260,6 +276,9 @@ class BaseDetector(Node):
                 needs_export = True
 
             if needs_export:
+                # Drop the unusable probe before exporting so a partially initialised
+                # backend does not hold GPU memory while the exporter builds a new one.
+                probe_model = None
                 fmt = model_path.suffix.lstrip('.')
                 self.get_logger().info(f'{model_path} failed to load or does not exist. Exporting from .pt...')
                 model_class(str(model_path.with_suffix('.pt'))).export(
@@ -275,9 +294,15 @@ class BaseDetector(Node):
 
         if did_export and self.export_and_exit:
             self.get_logger().info('export_and_exit=True — export finished; shutting node down.')
+            probe_model = None
             raise SystemExit(0)
 
-        self.model = model_class(str(model_path))
+        # Reuse the probe rather than constructing a second backend. Accessing
+        # probe_model.names above initialises the .engine/.onnx inference backend, so
+        # loading again while the probe is alive puts two full backends on the device —
+        # enough to OOM at startup on memory-constrained GPUs such as Jetson.
+        self.model = probe_model if probe_model is not None else model_class(str(model_path))
+        probe_model = None
         try:
             self.model.to(self.torch_device)
         except TypeError:
@@ -606,6 +631,33 @@ class BaseDetector(Node):
                         self.classes = list(val)
                         if hasattr(self, 'inference_dict'):
                             self.inference_dict['classes'] = self.classes
+            elif name == 'update_class' and ptype == Parameter.Type.STRING:
+                # Add or remove a single class without restating the whole list.
+                # On the CLI a leading dash needs `--`, e.g.
+                # `ros2 param set /<node> update_class -- -truck`.
+                self.update_class = val
+                mode, cls = ('remove', val[1:]) if val.startswith('-') else ('add', val)
+                if cls not in self.supported_class_names:
+                    result.successful = False
+                    result.reason = f"'{cls}' is not a supported class name."
+                    self.get_logger().warn(f"'{cls}' is not a supported class name.")
+                else:
+                    cls_key = self.class_names_inv.get(cls.strip())
+                    if mode == 'add' and cls_key not in self.classes:
+                        self.classes.append(cls_key)
+                        self.get_logger().info(f"Added '{cls}' to detection classes.")
+                    elif mode == 'remove' and cls_key in self.classes:
+                        self.classes.remove(cls_key)
+                        self.get_logger().info(f"Removed '{cls}' from detection classes.")
+                    if hasattr(self, 'inference_dict'):
+                        self.inference_dict['classes'] = self.classes
+                    # Re-enters this callback on the 'classes' branch, which does not
+                    # touch update_class, so the recursion terminates one level deep.
+                    self.set_parameters([
+                        Parameter(
+                            'classes', Parameter.Type.STRING_ARRAY,
+                            [self.class_names[x] for x in self.classes])
+                    ])
             elif name == 'agnostic_nms' and ptype == Parameter.Type.BOOL:
                 self.agnostic_nms = val
                 if hasattr(self, 'inference_dict'):
