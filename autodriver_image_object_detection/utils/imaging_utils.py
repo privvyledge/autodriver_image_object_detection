@@ -48,7 +48,10 @@ def parse_image_message(
         msg_encoding = msg.encoding
 
     if (msg_encoding.find("mono8") != -1) or (msg_encoding.find("8UC1") != -1):
-        msg_fmt = "mono8"
+        # cv_bridge refuses an 8UC1 -> mono8 conversion ("not a color format")
+        # even though the buffers are byte-identical, so ask for passthrough
+        # there and let the COLOR_GRAY2BGR conversion below do the expansion.
+        msg_fmt = "mono8" if msg_encoding.find("mono8") != -1 else "passthrough"
         is_color = False
         conversion = cv2.COLOR_GRAY2BGR
         inverse_conversion = cv2.COLOR_BGR2GRAY
