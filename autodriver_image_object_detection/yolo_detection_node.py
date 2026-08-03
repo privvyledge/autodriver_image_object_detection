@@ -129,7 +129,8 @@ from autodriver_image_object_detection.utils.imaging_utils import parse_image_me
 from autodriver_image_object_detection.utils.profiling import setup_profiler, apply_profiler_param
 
 if OPEN3D_AVAILABLE:
-    from autodriver_pointcloud_preprocessor.pointcloud_preprocessor import PointcloudPreprocessorNode
+    from autodriver_pointcloud_preprocessor.core import PointcloudPreprocessor, PreprocessorConfig
+    from autodriver_pointcloud_preprocessor.utils import ros_to_open3d_pointcloud
 
 
     # from autodriver_pointcloud_preprocessor.utils import (convert_pointcloud_to_numpy, numpy_struct_to_pointcloud2,
@@ -571,58 +572,21 @@ class ImageObstacleDetectionNode(Node):
                 self.output_frame_to_rgb_tf = None
                 self.output_frame_to_rgb_tf_o3d = None
                 self.previous_pointcloud = None
-                # pointcloud unpacking variables. todo: use my pointcloud preprocessor class to handle this later
-                self.pointcloud_preprocessor_namespace = 'detection_pointcloud_preprocessor'
-                self.pointcloud_preprocessor = PointcloudPreprocessorNode(
-                        node_name=self.pointcloud_preprocessor_namespace, enabled=False,
-                        parameter_namespace=self.pointcloud_preprocessor_namespace)
-                # to get the dict of all parameters: self.pointcloud_preprocessor.get_parameters_by_prefix(prefix=self.pointcloud_preprocessor_namespace.rstrip('.'))
-                self.pointcloud_preprocessor_namespace_param = f'{self.pointcloud_preprocessor_namespace}.'
-                preprocessor_params = (
-                        [
-                            Parameter(f'{self.pointcloud_preprocessor_namespace_param}use_gpu', Parameter.Type.BOOL,
-                                      self.use_gpu),
-                            Parameter(f'{self.pointcloud_preprocessor_namespace_param}transform_pointcloud',
-                                      Parameter.Type.BOOL,
-                                      True),
-                            Parameter(f'{self.pointcloud_preprocessor_namespace_param}transform_before_preprocessing',
-                                      Parameter.Type.BOOL,
-                                      False),
-                            Parameter(f'{self.pointcloud_preprocessor_namespace_param}robot_frame', Parameter.Type.STRING,
-                                      self.output_frame),
-                            Parameter(f'{self.pointcloud_preprocessor_namespace_param}static_camera_to_robot_tf', Parameter.Type.BOOL,
-                                      self.static_camera_to_robot_tf),
-                            Parameter(f'{self.pointcloud_preprocessor_namespace_param}transform_timeout',
-                                      Parameter.Type.DOUBLE,
-                                      self.transform_timeout),
-                            Parameter(f'{self.pointcloud_preprocessor_namespace_param}crop_to_roi', Parameter.Type.BOOL, self.crop_to_roi),
-                            Parameter(f'{self.pointcloud_preprocessor_namespace_param}roi_min', Parameter.Type.DOUBLE_ARRAY,
-                                      self.roi_min),
-                            Parameter(f'{self.pointcloud_preprocessor_namespace_param}roi_max',
-                                      Parameter.Type.DOUBLE_ARRAY,
-                                      self.roi_max),
-                            Parameter(f'{self.pointcloud_preprocessor_namespace_param}voxel_size',
-                                      Parameter.Type.DOUBLE,
-                                      self.voxel_size),
-                            Parameter(f'{self.pointcloud_preprocessor_namespace_param}remove_statistical_outliers', Parameter.Type.BOOL,
-                                      self.remove_statistical_outliers),
-                            Parameter(f'{self.pointcloud_preprocessor_namespace_param}estimate_normals',
-                                      Parameter.Type.BOOL,
-                                      self.estimate_normals),
-                            Parameter(f'{self.pointcloud_preprocessor_namespace_param}remove_ground',
-                                      Parameter.Type.BOOL,
-                                      self.remove_ground),
-                        ]
+                # pointcloud unpacking variables.
+                preprocessor_cfg = PreprocessorConfig(
+                    device=self.o3d_device,
+                    transform_pointcloud=True,
+                    transform_before_preprocessing=False,
+                    crop_to_roi=self.crop_to_roi,
+                    roi_min=self.roi_min,
+                    roi_max=self.roi_max,
+                    voxel_size=self.voxel_size,
+                    remove_statistical_outliers=self.remove_statistical_outliers,
+                    estimate_normals=self.estimate_normals,
+                    remove_ground=self.remove_ground
                 )
-                # The child PointcloudPreprocessorNode may not have declared these namespaced
-                # params (e.g. when constructed with enabled=False), so a plain set_parameters()
-                # raises ParameterNotDeclaredException. Declare-if-missing then set, so config
-                # works regardless of the preprocessor's declaration timing.
-                for _pp in preprocessor_params:
-                    if self.pointcloud_preprocessor.has_parameter(_pp.name):
-                        self.pointcloud_preprocessor.set_parameters([_pp])
-                    else:
-                        self.pointcloud_preprocessor.declare_parameter(_pp.name, _pp.value)
+                self.pointcloud_preprocessor = PointcloudPreprocessor(preprocessor_cfg)
+                self.pointcloud_preprocessor_metadata = {}
 
         self.previous_time = time.time()
         self.previous_callback_time = None
@@ -868,10 +832,7 @@ class ImageObstacleDetectionNode(Node):
             if self.project_to_3d and self.use_pointcloud:
                 # unpack pointcloud message
                 ros_cloud = msg[-1]
-                # extract PointCloud from struct message
-                self.pointcloud_preprocessor.extract_pointcloud(ros_cloud)
 
-                # Preprocess pointcloud: if input is a pointcloud, transform the pointcloud here
                 self.frame_ids['pointcloud'] = ros_cloud.header.frame_id
                 self.headers['pointcloud'] = ros_cloud.header
                 self.msg_metadata['pointcloud'] = {
@@ -883,25 +844,30 @@ class ImageObstacleDetectionNode(Node):
                         self.frame_ids['pointcloud'],
                         None if self.static_camera_to_robot_tf else self.msg_metadata['pointcloud'].get('msg_timestamp'),
                 )
-                self.pointcloud_preprocessor.camera_to_robot_tf = self.camera_to_robot_tf_o3d
 
-                # preprocess the pointcloud
-                self.pointcloud_preprocessor.preprocess()
-                new_header = self.pointcloud_preprocessor.create_header(ros_cloud)
-                pc_fields = self.pointcloud_preprocessor.pointcloud_metadata['field_names']
+                # extract PointCloud using utility
+                o3d_cloud, _, metadata = ros_to_open3d_pointcloud(
+                    ros_cloud,
+                    device=self.o3d_device,
+                    remove_nans=True,
+                    organize_cloud=True,
+                    field_names=None,
+                    metadata_dict=self.pointcloud_preprocessor_metadata
+                )
+                self.pointcloud_preprocessor_metadata = metadata
+
+                if o3d_cloud is not None:
+                    # preprocess the pointcloud
+                    self.o3d_pointcloud, _ = self.pointcloud_preprocessor.process(
+                        o3d_cloud, self.camera_to_robot_tf_o3d)
+                else:
+                    self.o3d_pointcloud = o3d.t.geometry.PointCloud(self.o3d_device)
+
+                pc_fields = self.pointcloud_preprocessor_metadata.get('field_names', [])
                 self.msg_metadata['pointcloud']['field_names'] = pc_fields
 
-                # copy the pointcloud.  todo: use one instead of all(self.o3d_pointcloud, self.pointcloud_preprocessor.o3d_pointcloud, self.images['pointcloud'])
-                self.o3d_pointcloud = self.pointcloud_preprocessor.o3d_pointcloud.clone()
-                # todo: transform the pointcloud in case the PointCloud Preprocessor node fails to transform
-                # if self.camera_to_robot_tf_o3d is not None:
-                #     # copy the original positions before transforming for later use without inversion.
-                #     # Leads to significant speedup over multiple transformations.
-                #     self.o3d_pointcloud.point.positions_inv = self.o3d_pointcloud.point.positions.clone()
-                #     frame_id = self.output_frame
-
                 if not self.o3d_pointcloud.is_empty():
-                    self.images['pointcloud'] = self.o3d_pointcloud.point.positions  # .cpu().numpy()  # todo: refactor without transfering to CPU or using numpy, i.e use torch tensors
+                    self.images['pointcloud'] = self.o3d_pointcloud.point.positions
 
             # try:
             #    self.results = next(self.results)
@@ -1690,7 +1656,7 @@ class ImageObstacleDetectionNode(Node):
         if self.output_frame_to_rgb_tf_o3d is None or not self.static_camera_to_robot_tf:
             # source_frame = self.output_frame or self.frame_ids['pointcloud']
             source_frame = self.frame_ids['pointcloud']
-            if self.output_frame and self.pointcloud_preprocessor.transform_pointcloud:
+            if self.output_frame and self.pointcloud_preprocessor.config.transform_pointcloud:
                 source_frame = self.output_frame
 
             transform = self.lookup_transform(
@@ -2268,9 +2234,8 @@ class ImageObstacleDetectionNode(Node):
                 pass
         # delete the open3d pointlcoud object cleanly
         if self.project_to_3d and self.use_pointcloud:
-            self.pointcloud_preprocessor.o3d_pointcloud.clear()
             self.o3d_pointcloud.clear()
-            del self.o3d_pointcloud, self.pointcloud_preprocessor.o3d_pointcloud
+            del self.o3d_pointcloud
         return None
 
 
