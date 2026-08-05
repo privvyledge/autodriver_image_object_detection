@@ -31,7 +31,7 @@ temp*.py
 # Private tooling and agent context — must never be committed
 CLAUDE.md
 PLAN.md
-HANDOFF.md
+HANDOFF*.md
 commit.txt
 .claude/
 .codegraph/
