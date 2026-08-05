@@ -35,8 +35,12 @@ Topic mapping (gosling1 bag -> yolo_detector):
     /gosling1/camera/color/camera_info                   -> input_camera_info_topic
     /gosling1/camera/aligned_depth_to_color/image_raw    -> depth_image_topic
     /gosling1/camera/aligned_depth_to_color/camera_info  -> depth_camera_info_topic
-    /gosling1/camera/downsampled_cloud_from_depth        -> pointcloud_topic
+    /gosling1/camera/depth/color/points                  -> pointcloud_topic
     /gosling1/tf + /gosling1/tf_static                   -> remapped to /tf + /tf_static
+
+The default cloud is the driver's own XYZRGB stream, in the *depth* optical frame at
+full resolution and 30 Hz — noticeably heavier for DBSCAN than a pre-downsampled cloud.
+Override pointcloud_topic for bags recorded with the preprocessor in the loop.
 
 Output topics:
     /yolo/detection_results                 Detection2DArray (pixels)
@@ -146,6 +150,12 @@ def launch_setup(context, *args, **kwargs):
     bag_path = cfg('bag_path')
     startup_delay = float(cfg('startup_delay'))
 
+    image_topic = '/gosling1/camera/color/image_raw'
+    image_info_topic = '/gosling1/camera/color/camera_info'
+    depth_topic = '/gosling1/camera/aligned_depth_to_color/image_raw'
+    depth_info_topic = '/gosling1/camera/aligned_depth_to_color/camera_info'
+    cloud_topic = cfg('pointcloud_topic')
+
     actions = [SetParameter(name='use_sim_time', value=True)]
     actions.extend(_d435i_static_tf_nodes())
 
@@ -157,11 +167,11 @@ def launch_setup(context, *args, **kwargs):
         additional_env=_node_env(),
         parameters=[{
             'use_sim_time': True,
-            'input_image_topic': '/gosling1/camera/color/image_raw',
-            'input_camera_info_topic': '/gosling1/camera/color/camera_info',
-            'depth_image_topic': '/gosling1/camera/aligned_depth_to_color/image_raw',
-            'depth_camera_info_topic': '/gosling1/camera/aligned_depth_to_color/camera_info',
-            'pointcloud_topic': '/gosling1/camera/downsampled_cloud_from_depth',
+            'input_image_topic': image_topic,
+            'input_camera_info_topic': image_info_topic,
+            'depth_image_topic': depth_topic,
+            'depth_camera_info_topic': depth_info_topic,
+            'pointcloud_topic': cloud_topic,
             'model_path': _resolve_model(pkg, cfg('model_path')),
             'conf_thresh': float(cfg('conf_threshold')),
             'project_to_3d': True,
@@ -198,6 +208,22 @@ def launch_setup(context, *args, **kwargs):
                 '--clock',
                 '--rate', cfg('playback_rate'),
                 '--read-ahead-queue-size', '1000',
+            ]
+            # Replay only what the node subscribes to. This cuts deserialization and
+            # publishing work, not disk reads — rosbag2 still streams the whole file
+            # sequentially, so a bag that outruns the disk stays I/O-bound and needs
+            # a lower playback_rate as well. Worth knowing which symptom is which:
+            # a starved player reports "Message queue starved" and can end up
+            # publishing nothing at all, which reads exactly like a broken node.
+            if flag('play_only_used_topics'):
+                topics = [image_topic, image_info_topic]
+                if flag('use_depth'):
+                    topics += [depth_topic, depth_info_topic]
+                if flag('use_pointcloud'):
+                    topics.append(cloud_topic)
+                topics += ['/gosling1/tf', '/gosling1/tf_static']
+                bag_cmd += ['--topics'] + topics
+            bag_cmd += [
                 '--remap', '/gosling1/tf:=/tf',
                 '--remap', '/gosling1/tf_static:=/tf_static',
             ]
@@ -221,6 +247,14 @@ def generate_launch_description():
                               description='YOLO model. Use .pt on desktop/WSL, .engine on Jetson'),
         DeclareLaunchArgument('output_frame', default_value='sensor_kit_link',
                               description='TF frame for 3D output; empty to use the sensor frame'),
+        DeclareLaunchArgument('pointcloud_topic',
+                              default_value='/gosling1/camera/depth/color/points',
+                              description='Cloud feeding the DBSCAN projection path. The '
+                                          'default is the RealSense driver\'s own full-rate '
+                                          'XYZRGB cloud, which every gosling1 bag carries. '
+                                          'Bags recorded with the preprocessor running also '
+                                          'carry the cheaper pre-downsampled '
+                                          '/gosling1/camera/downsampled_cloud_from_depth'),
         DeclareLaunchArgument('use_depth', default_value='true',
                               description='Enable the depth-image projection path'),
         DeclareLaunchArgument('use_pointcloud', default_value='true',
@@ -234,11 +268,26 @@ def generate_launch_description():
                                           'With tracking off each frame is independent and matched '
                                           'timestamps are directly comparable.'),
         DeclareLaunchArgument('sync_slop', default_value='0.2',
-                              description='Synchronizer slop (s); needs >= 0.167 for this bag'),
+                              description='Synchronizer slop (s). 0.2 suits bags whose colour '
+                                          'and depth run at different rates (~6 vs ~7.5 Hz needs '
+                                          '>= 0.167). On a bag where both streams are 30 Hz the '
+                                          'true pairing offset is a few ms, and this default '
+                                          'lets the synchronizer accept a partner up to six '
+                                          'frames stale — pass ~0.02 there instead, or moving '
+                                          'obstacles project against the wrong depth frame'),
         DeclareLaunchArgument('sync_queue_size', default_value='20',
                               description='Synchronizer queue depth; must be > 1 for multi-rate topics'),
         DeclareLaunchArgument('playback_rate', default_value='1.0',
-                              description='Bag playback rate multiplier'),
+                              description='Bag playback rate multiplier. Lower it if the '
+                                          'player reports "Message queue starved" — that '
+                                          'means the bag needs more read bandwidth than the '
+                                          'disk supplies, and a starved player can publish '
+                                          'nothing at all'),
+        DeclareLaunchArgument('play_only_used_topics', default_value='true',
+                              description='Pass --topics so the player replays only the '
+                                          'topics this node subscribes to. Keeps a big '
+                                          'multi-sensor bag within the available disk read '
+                                          'bandwidth; set false to replay everything'),
         DeclareLaunchArgument('loop_bag', default_value='false',
                               description='Loop the bag; keep false for a repeatable A/B pass'),
         DeclareLaunchArgument('startup_delay', default_value='12.0',
