@@ -77,6 +77,12 @@ class SingleStreamDetector(BaseDetector):
         self.image_sub = self.create_subscription(
             self.image_message_type, self.input_image_topic, self.image_callback, sensor_qos,
             callback_group=self._sub_cb_group)
+        # This node publishes pixel-space Detection2DArray and needs no intrinsics: the
+        # inference size comes from the frame itself (use_image_dimensions) or the
+        # image_dimensions parameter. CameraInfo is stored for consumers that do want it
+        # (ROI/undistort work) but is deliberately NOT a precondition for inference --
+        # gating on it silently produced zero detections for any source without a
+        # CameraInfo publisher (video file, or a bag recorded without the topic).
         self.camera_info_sub = self.create_subscription(
             CameraInfo, self.input_camera_info_topic, self.camera_info_callback, qos_profile,
             callback_group=self._sub_cb_group)
@@ -125,9 +131,6 @@ class SingleStreamDetector(BaseDetector):
             try:
                 msg = self._image_queue.get(timeout=0.1)
             except queue.Empty:
-                continue
-            if self.camera_info is None:
-                self.get_logger().warn('No CameraInfo received yet — skipping frame.', once=True)
                 continue
             try:
                 (cv_image, msg_encoding, image_frame_id, msg_timestamp, msg_fmt,
