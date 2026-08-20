@@ -23,6 +23,7 @@ from autodriver_image_object_detection.utils.common import (
     pack_2d_detection,
     update_tracker_param,
 )
+from autodriver_image_object_detection.utils.geometry_utils import polygon_axis
 
 
 class BaseDetector(Node):
@@ -54,7 +55,7 @@ class BaseDetector(Node):
         'use_gpu', 'show_image', 'use_image_dimensions', 'image_dimensions',
         'resize_image', 'half_precision', 'conf_thresh', 'iou_thresh', 'max_det',
         'classes', 'agnostic_nms', 'augment', 'verbose', 'static_camera_info',
-        'update_class',
+        'update_class', 'publish_oriented_bbox', 'oriented_bbox_size_mode',
     })
 
     def __init__(self, node_name: str):
@@ -161,6 +162,28 @@ class BaseDetector(Node):
         self.declare_parameter('tracker_2d.model', d.get('tracker_2d.model', 'auto'))
         self.declare_parameter('plot_tracks', d.get('plot_tracks', True))
         self.declare_parameter('static_camera_info', d.get('static_camera_info', True))
+        self.declare_parameter(
+            'publish_oriented_bbox', d.get('publish_oriented_bbox', False),
+            ParameterDescriptor(
+                type=ParameterType.PARAMETER_BOOL,
+                description=(
+                    'Write the instance mask principal axis into '
+                    'Detection2D.bbox.center.theta and replace size_x/size_y with '
+                    'the extents of that rotated box. Off by default because it '
+                    'changes the meaning of size_x/size_y for consumers that '
+                    'assume an axis-aligned box. Requires a segmentation model; '
+                    'detections with no mask stay axis-aligned with theta=0.')))
+        self.declare_parameter(
+            'oriented_bbox_size_mode', d.get('oriented_bbox_size_mode', 'obb'),
+            ParameterDescriptor(
+                type=ParameterType.PARAMETER_STRING,
+                description=(
+                    "How size_x/size_y are filled when publish_oriented_bbox is "
+                    "on. 'obb': extents of the silhouette projected onto the "
+                    "principal axes (a true oriented bounding box). 'moments': "
+                    "4*sqrt(lambda) of the equivalent ellipse, so size_x/size_y "
+                    "is exactly the second-moment elongation "
+                    "sqrt(lambda_major/lambda_minor).")))
 
     def _read_common_params(self) -> None:
         """Read all common parameters into self.* and initialise shared state."""
@@ -189,6 +212,13 @@ class BaseDetector(Node):
         self.tracker_2d_cfg = {k: v.value for k, v in self.get_parameters_by_prefix('tracker_2d').items()}
         self.plot_tracks = gp('plot_tracks').get_parameter_value().bool_value
         self.static_camera_info = gp('static_camera_info').get_parameter_value().bool_value
+        self.publish_oriented_bbox = gp('publish_oriented_bbox').get_parameter_value().bool_value
+        self.oriented_bbox_size_mode = gp('oriented_bbox_size_mode').get_parameter_value().string_value
+        if self.oriented_bbox_size_mode not in ('obb', 'moments'):
+            self.get_logger().warn(
+                f"Unsupported oriented_bbox_size_mode '{self.oriented_bbox_size_mode}'; "
+                f"falling back to 'obb'.")
+            self.oriented_bbox_size_mode = 'obb'
 
         self.bridge = CvBridge()
         self.results = None
@@ -474,6 +504,12 @@ class BaseDetector(Node):
         Renders the annotated image and composites the segmentation mask.
         Appends track history polylines when track_2d and plot_tracks are both True.
 
+        Boxes are axis-aligned pixels with theta = 0 unless publish_oriented_bbox
+        is set, in which case each detection carrying an instance mask gets that
+        mask's principal axis in bbox.center.theta and the corresponding rotated
+        extents in size_x/size_y. See _param_defaults / declare_common_params for
+        the two parameters, and utils.geometry_utils.polygon_axis for the math.
+
         Args:
             result: A single element from the Ultralytics Results list.
             header: The ROS2 Header to stamp the Detection2DArray.
@@ -528,9 +564,28 @@ class BaseDetector(Node):
         all_cls = boxes.cls.numpy().astype(int)
         all_conf = boxes.conf.numpy()
 
+        # Per-instance mask outlines, in the same source-image pixel space as
+        # boxes.xywh and index-aligned with it. .xy rescales on every access, so
+        # take it once.
+        mask_polys = None
+        if self.publish_oriented_bbox and result.masks is not None:
+            mask_polys = result.masks.xy
+
         for i, (bbox, cls, conf) in enumerate(zip(all_xywh, all_cls, all_conf)):
             x, y, w, h = bbox
             track_id = track_ids[i] if track_ids is not None else -1
+            theta = 0.0
+
+            if mask_polys is not None and i < len(mask_polys):
+                axis = polygon_axis(mask_polys[i])
+                if axis is not None:
+                    theta = axis.angle
+                    if self.oriented_bbox_size_mode == 'moments':
+                        # size_x / size_y is then exactly the second-moment
+                        # elongation sqrt(lambda_major / lambda_minor).
+                        w, h = axis.ellipse_major, axis.ellipse_minor
+                    else:
+                        w, h = axis.major, axis.minor
 
             if (self.track_2d and self.plot_tracks and detection_image is not None
                     and hasattr(self, 'track_history')):
@@ -542,7 +597,8 @@ class BaseDetector(Node):
                 cv2.polylines(detection_image, [pts], isClosed=False, color=(230, 230, 230), thickness=5)
 
             detections_msg.detections.append(
-                pack_2d_detection(x, y, w, h, result.names.get(int(cls)), conf, id=track_id)
+                pack_2d_detection(x, y, w, h, result.names.get(int(cls)), conf,
+                                  id=track_id, theta=theta)
             )
 
         return detections_msg, detection_image, mask_img
@@ -568,6 +624,15 @@ class BaseDetector(Node):
                 self.tracker_2d_cfg['path'] = val
             elif name == 'plot_tracks' and ptype == Parameter.Type.BOOL:
                 self.plot_tracks = val
+            elif name == 'publish_oriented_bbox' and ptype == Parameter.Type.BOOL:
+                self.publish_oriented_bbox = val
+            elif name == 'oriented_bbox_size_mode' and ptype == Parameter.Type.STRING:
+                if val in ('obb', 'moments'):
+                    self.oriented_bbox_size_mode = val
+                else:
+                    result.successful = False
+                    result.reason = (
+                        f"oriented_bbox_size_mode must be 'obb' or 'moments', got '{val}'")
             elif name == 'use_gpu' and ptype == Parameter.Type.BOOL:
                 self.device = 'cpu'
                 self.torch_device = torch.device('cpu')

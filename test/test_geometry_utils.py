@@ -1,4 +1,5 @@
 """Tests for utils/geometry_utils.py — polygon winding and point-in-polygon."""
+import math
 import os
 import sys
 import unittest
@@ -11,6 +12,7 @@ from autodriver_image_object_detection.utils.geometry_utils import (  # noqa: E4
     batch_points_in_polygon,
     ensure_ccw_polygon,
     point_in_polygon,
+    polygon_axis,
 )
 
 
@@ -107,6 +109,72 @@ class TestBatchPointsInPolygon(unittest.TestCase):
     def test_empty_input(self):
         mask = batch_points_in_polygon(np.zeros((0, 2), dtype=np.float32), SQUARE_CCW)
         self.assertEqual(mask.shape, (0,))
+
+
+class TestPolygonAxis(unittest.TestCase):
+    """polygon_axis() must read the axis off the filled shape, not the vertices."""
+
+    @staticmethod
+    def _rect(w, h, angle_deg, cx=100.0, cy=50.0):
+        pts = np.array([[-w / 2, -h / 2], [w / 2, -h / 2],
+                        [w / 2, h / 2], [-w / 2, h / 2]])
+        a = math.radians(angle_deg)
+        c, s = math.cos(a), math.sin(a)
+        return pts @ np.array([[c, -s], [s, c]]).T + np.array([cx, cy])
+
+    def test_rectangle_axis_and_extents_are_exact(self):
+        for deg in (0.0, 30.0, -45.0, 80.0):
+            with self.subTest(deg=deg):
+                axis = polygon_axis(self._rect(40.0, 10.0, deg))
+                self.assertAlmostEqual(math.degrees(axis.angle), deg, places=6)
+                # A 4:1 rectangle has sqrt(lambda_major/lambda_minor) == 4.
+                self.assertAlmostEqual(axis.elongation, 4.0, places=6)
+                self.assertAlmostEqual(axis.major, 40.0, places=6)
+                self.assertAlmostEqual(axis.minor, 10.0, places=6)
+                self.assertAlmostEqual(axis.cx, 100.0, places=6)
+                self.assertAlmostEqual(axis.cy, 50.0, places=6)
+
+    def test_winding_order_does_not_change_the_axis(self):
+        """Interop vector: clockwise input must give +30 deg, elongation 4.
+
+        Real contours from Ultralytics `masks.xy` are clockwise in image
+        coordinates, so this is the ordinary case, not an edge case. The
+        absolute values are asserted and not just ccw == cw: an implementation
+        that loses the sign of the signed area agrees with itself in both
+        orders while sitting exactly 90 degrees away from this.
+        """
+        poly = self._rect(40.0, 10.0, 30.0)
+        ccw, cw = polygon_axis(poly), polygon_axis(poly[::-1])
+        self.assertAlmostEqual(ccw.angle, cw.angle, places=9)
+        self.assertAlmostEqual(ccw.elongation, cw.elongation, places=9)
+        self.assertAlmostEqual(math.degrees(cw.angle), 30.0, places=6)
+        self.assertAlmostEqual(cw.elongation, 4.0, places=6)
+
+    def test_ellipse_extents_ratio_equals_elongation(self):
+        axis = polygon_axis(self._rect(40.0, 10.0, 17.0))
+        self.assertAlmostEqual(
+            axis.ellipse_major / axis.ellipse_minor, axis.elongation, places=9)
+
+    def test_circular_blob_has_elongation_one(self):
+        t = np.linspace(0.0, 2 * np.pi, 256, endpoint=False)
+        axis = polygon_axis(np.c_[30 * np.cos(t), 30 * np.sin(t)])
+        self.assertAlmostEqual(axis.elongation, 1.0, places=4)
+
+    def test_uneven_vertex_sampling_does_not_bias_the_axis(self):
+        """The reason for exact moments over vertex PCA.
+
+        Densely resampling one long edge of a rectangle moves a vertex PCA but
+        must leave the filled shape's moments untouched.
+        """
+        poly = self._rect(40.0, 10.0, 0.0)
+        dense_edge = np.c_[np.linspace(80.0, 120.0, 50), np.full(50, 45.0)]
+        resampled = np.vstack([dense_edge, poly[2:4]])
+        self.assertAlmostEqual(
+            polygon_axis(resampled).angle, polygon_axis(poly).angle, places=6)
+
+    def test_degenerate_polygons_return_none(self):
+        self.assertIsNone(polygon_axis(np.array([[0.0, 0.0], [1.0, 1.0]])))
+        self.assertIsNone(polygon_axis(np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])))
 
 
 if __name__ == '__main__':

@@ -397,6 +397,7 @@ class DepthFusionNode(BaseDetector):
         marker_arr = MarkerArray()
 
         for i, det in enumerate(detections_msg.detections):
+            self._warn_if_oriented(det)
             bbox = (det.bbox.center.position.x, det.bbox.center.position.y,
                     det.bbox.size_x, det.bbox.size_y)
             conf = det.results[0].hypothesis.score if det.results else 0.0
@@ -563,6 +564,7 @@ class DepthFusionNode(BaseDetector):
             pts_optical = self.o3d_pointcloud.point.positions
 
         for i, det in enumerate(detections_msg.detections):
+            self._warn_if_oriented(det)
             bbox = (det.bbox.center.position.x, det.bbox.center.position.y,
                     det.bbox.size_x, det.bbox.size_y)
             conf = det.results[0].hypothesis.score if det.results else 0.0
@@ -582,6 +584,23 @@ class DepthFusionNode(BaseDetector):
 
         self.detection3d_pc_pub.publish(det3d_arr)
         self.marker_pc_pub.publish(marker_arr)
+
+    def _warn_if_oriented(self, det) -> None:
+        """Warn once if an upstream detector is sending rotated 2D boxes.
+
+        Both projection paths here treat size_x/size_y as an axis-aligned ROI.
+        A producer running with publish_oriented_bbox writes the mask principal
+        axis into bbox.center.theta and the rotated extents into the sizes, so
+        the ROI this node cuts would be wrong without any error being raised.
+        """
+        if getattr(det.bbox.center, 'theta', 0.0) == 0.0:
+            return
+        if not getattr(self, '_warned_oriented_bbox', False):
+            self._warned_oriented_bbox = True
+            self.get_logger().warn(
+                'Received a Detection2D with a non-zero bbox.center.theta. This node '
+                'projects axis-aligned ROIs only, so rotated boxes will cut the wrong '
+                'region. Set publish_oriented_bbox:=false on the upstream detector.')
 
     def _update_camera_to_robot_tf(self, timestamp=None):
         """Cache the pointcloud-frame → output_frame transform."""

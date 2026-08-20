@@ -14,10 +14,23 @@ except ImportError:
     print("nav2_dynamic_msgs not found. ")
 
 
-def pack_2d_detection(x, y, size_x, size_y, class_id, conf, id):
+def pack_2d_detection(x, y, size_x, size_y, class_id, conf, id, theta=0.0):
+    """Pack one detection into a vision_msgs/Detection2D.
+
+    Position and size are PIXELS in the frame named by the enclosing
+    Detection2DArray header.
+
+    theta is the rotation of the box about its centre, in radians, in the image
+    frame (x right, y DOWN). It is 0.0 for an axis-aligned box, in which case
+    size_x/size_y are the axis-aligned width/height. When theta is non-zero the
+    box is rotated, so size_x is the extent along theta and size_y the extent
+    perpendicular to it -- consumers that assume an axis-aligned box must check
+    theta before using the sizes.
+    """
     detection = Detection2D()
     detection.bbox.center.position.x = float(x)
     detection.bbox.center.position.y = float(y)
+    detection.bbox.center.theta = float(theta)
     detection.bbox.size_x = float(size_x)
     detection.bbox.size_y = float(size_y)
     detection.id = str(id)
